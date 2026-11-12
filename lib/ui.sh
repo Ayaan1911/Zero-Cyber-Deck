@@ -77,6 +77,7 @@ ui_category() {
     IFS='|' read -r c label func deps <<<"${ZD_REG[i]}"
     [ "$c" = "$cat" ] || continue
     idx+=("$i"); miss="$(missing_of "$deps")"
+    label="${label/#\[MANUAL\]/${C_BAD}[MANUAL]${C_RST}}"  # manual tools are visibly outside the scope gate
     if [ -z "$miss" ]; then mark="${C_OK}[+]${C_RST}"; labels+=("$mark $label"); else mark="${C_BAD}[-]${C_RST}"; labels+=("$mark $label ${C_DIM}(needs: $miss)${C_RST}"); fi
   done
   [ "${#idx[@]}" -gt 0 ] || { say "No tools registered for $cat."; pause; return 0; }

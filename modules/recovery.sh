@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# System recovery: read-only disk overview and health, playbook, TestDisk (manual).
+# System recovery: read-only disk overview and health, playbook; TestDisk is a MANUAL launcher.
 
 disk_overview() { logrun disk_overview lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS; }
 
@@ -20,4 +20,4 @@ testdisk_launch() {
 reg "System Recovery" "Disk + partition overview (lsblk, read-only)" disk_overview "lsblk"
 reg "System Recovery" "SMART health of a disk (read-only)" smart_health "smartctl"
 reg "System Recovery" "Recovery playbook (offline)" recovery_playbook ""
-reg "System Recovery" "Open TestDisk (manual, can write)" testdisk_launch "testdisk"
+regm "System Recovery" "TestDisk (can write to disks)" testdisk_launch "testdisk"

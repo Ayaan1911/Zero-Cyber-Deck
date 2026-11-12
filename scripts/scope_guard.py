@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Scope gate for ZERO CyberSec Deck: the single policy engine for Kali and Windows.
+"""Scope gate for ZERO CyberSec Deck: the single policy engine for Kali and Windows (Python 3.8+).
 
 A guardrail, not proof of permission. Rules:
-  * scope entries (IPv4 / IPv4 CIDR no broader than /24 / exact FQDN) come from config/scope.txt
-  * a hostname must be listed AND every IPv4 address it resolves to must fall inside a
-    listed network, so DNS can never widen scope
-  * the CLI prints the normalized, pinned values the caller must use (key=value lines)
-  * every decision can be appended to an audit log (fail closed if it cannot be written)
+  * scope entries (IPv4 / IPv4 CIDR no broader than /24 / exact FQDN) come from the scope file
+  * DNS policy (two phases, so nothing is looked up before the operator agrees):
+      --no-resolve   static check only: syntax, listed name or in-network IP. NO DNS query is made.
+      (default)      resolve the listed name; EVERY IPv4 answer must lie inside a listed network.
+    The caller then connects to the printed, verified address (addr=/addrs=), never to a fresh lookup.
+  * every decision can be appended to an audit log; if a required entry cannot be written the gate fails closed.
+    The audit log is a plain text file: it records, it does not prevent tampering.
+  * URL secrets (query values, userinfo, long token-like path segments, fragments) are redacted in logs.
 """
 from __future__ import annotations
 
@@ -23,9 +26,25 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pathsafe import is_link  # noqa: E402
+
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
 URL_BAD_RE = re.compile(r"[^\x21-\x7e]|[\\\[\]{}<>^`|\"']")  # non-printable, whitespace, curl globs, quotes
 MAX_ADDRESSES = 256  # /24
+
+_QUERY_VALUE_RE = re.compile(r"([?&;][^=&;#\s]*=)[^&;#\s]*")
+_USERINFO_RE = re.compile(r"(//)[^/@\s]*@")
+_LONG_SEGMENT_RE = re.compile(r"(?<=/)[A-Za-z0-9_\-.~%]{24,}(?=/|\?|#|$)")
+_FRAGMENT_RE = re.compile(r"#.*$")
+
+
+def redact(text: str) -> str:
+    """Best-effort removal of secrets from a URL-ish string before it reaches any log."""
+    text = _FRAGMENT_RE.sub("#REDACTED", text) if "#" in text else text
+    text = _USERINFO_RE.sub(r"\1REDACTED@", text)
+    text = _QUERY_VALUE_RE.sub(r"\1REDACTED", text)
+    return _LONG_SEGMENT_RE.sub("REDACTED", text)
 
 
 class OutOfScope(Exception):
@@ -35,9 +54,9 @@ class OutOfScope(Exception):
 @dataclass(frozen=True)
 class Decision:
     host: str                     # normalized IP, FQDN, or CIDR
-    addrs: tuple[str, ...] = ()   # IPv4 addresses to connect to (all verified in scope)
-    port: int | None = None
-    url: str = ""                 # normalized URL (kind == url)
+    addrs: tuple = ()             # verified IPv4 addresses to connect to (empty before resolution)
+    port: "int | None" = None
+    url: str = ""                 # normalized URL (kind == url); may contain secrets: never log it, log redact(url)
 
 
 Resolver = Callable[[str], list]
@@ -88,7 +107,7 @@ def parse_allowed(path: Path):
     return networks, domains
 
 
-def classify_host(host: str) -> tuple[str, str]:
+def classify_host(host: str):
     host = host.strip().lower().rstrip(".")
     if not host or host.startswith("-") or any(c.isspace() for c in host):
         raise ValueError("A single IP or hostname is required")
@@ -105,7 +124,7 @@ def classify_host(host: str) -> tuple[str, str]:
     return "domain", host
 
 
-def _parse_url(target: str) -> tuple[str, str, int, str]:
+def _parse_url(target: str):
     if URL_BAD_RE.search(target):
         raise ValueError("URL contains whitespace, control, glob or quote characters")
     parts = urlsplit(target)
@@ -121,11 +140,12 @@ def _parse_url(target: str) -> tuple[str, str, int, str]:
     return scheme, parts.hostname or "", port or (443 if scheme == "https" else 80), parts.path + (f"?{parts.query}" if parts.query else "")
 
 
-def evaluate(scope_file: Path, target: str, kind: str, resolver: Resolver = resolve_ipv4) -> Decision:
-    """Return the verified Decision, raise OutOfScope, or raise ValueError for bad input."""
+def evaluate(scope_file: Path, target: str, kind: str, resolver: Resolver = resolve_ipv4, resolve: bool = True) -> Decision:
+    """Return the Decision, raise OutOfScope, or raise ValueError for bad input.
+    resolve=False performs the static checks only and never calls the resolver."""
     networks, domains = parse_allowed(scope_file)
     if not networks and not domains:
-        raise ValueError("Scope is empty. Add your explicitly authorized IPs/CIDRs/domains to config/scope.txt")
+        raise ValueError("Scope is empty. Add your explicitly authorized IPs/CIDRs/domains to the scope file")
 
     if kind == "network":
         net = _network(target.strip())
@@ -156,12 +176,14 @@ def evaluate(scope_file: Path, target: str, kind: str, resolver: Resolver = reso
 
     if host not in domains:
         raise OutOfScope(f"{host} is not a listed domain")
+    if not resolve:
+        return Decision(host=host, port=port, url=url)
     addrs = resolver(host)
     if not addrs:
         raise ValueError(f"{host} resolved to no IPv4 address")
     stray = [a for a in addrs if not any(ipaddress.ip_address(a) in net for net in networks)]
     if stray:
-        raise OutOfScope(f"{host} resolves to address(es) outside scope: {', '.join(stray)}; list their IPs in scope.txt if authorized")
+        raise OutOfScope(f"{host} resolves to address(es) outside scope: {', '.join(stray)}; list their IPs in the scope file if authorized")
     return Decision(host=host, addrs=tuple(addrs), port=port, url=url)
 
 
@@ -173,7 +195,13 @@ def approved(scope_file: Path, target: str, kind: str, resolver: Resolver = reso
         return False
 
 
+def _clean(text: str) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", "?", text)[:300]
+
+
 def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail: str, scope_file: Path) -> None:
+    if is_link(path):
+        raise OSError(f"audit log is a link/junction: {path}")
     try:
         digest = hashlib.sha256(scope_file.read_bytes()).hexdigest()[:16]
     except OSError:
@@ -182,9 +210,9 @@ def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail
         user = getpass.getuser()
     except Exception:  # noqa: BLE001 - getuser can raise many things on odd systems
         user = "unknown"
-    clean = lambda s: re.sub(r"[\x00-\x1f\x7f]", "?", s)[:300]  # noqa: E731
-    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), clean(user),
-                     clean(action), kind, clean(target), verdict, digest, clean(detail)])
+    shown = redact(target) if kind == "url" else target
+    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), _clean(user),
+                     _clean(action), kind, _clean(shown), verdict, digest, _clean(redact(detail) if kind == "url" else detail)])
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(row + "\n")
@@ -194,6 +222,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--audit", type=Path, help="append the decision to this audit log (fail closed)")
     parser.add_argument("--action", default="check")
+    parser.add_argument("--no-resolve", action="store_true", help="static checks only; perform NO DNS lookup")
     parser.add_argument("scope", type=Path)
     parser.add_argument("kind", choices=["host", "network", "url", "validate"])
     parser.add_argument("target", nargs="?", default="")
@@ -208,8 +237,11 @@ def main(argv=None) -> int:
             networks, domains = parse_allowed(args.scope)
             print(f"scope OK: {len(networks)} network(s), {len(domains)} domain(s)")
             return 0
-        decision = evaluate(args.scope, args.target, args.kind)
-        log("ALLOW", f"host={decision.host} addrs={','.join(decision.addrs)}")
+        decision = evaluate(args.scope, args.target, args.kind, resolve=not args.no_resolve)
+        if args.no_resolve:
+            log("PRECHECK", "static check only; no DNS performed")
+        else:
+            log("ALLOW", f"host={decision.host} addrs={','.join(decision.addrs)}")
     except OutOfScope as exc:
         print(f"OUT OF SCOPE: {exc}", file=sys.stderr)
         verdict, detail = "DENY", str(exc)
@@ -224,10 +256,12 @@ def main(argv=None) -> int:
         print(f"host={decision.host}")
         if decision.addrs:
             print(f"addr={decision.addrs[0]}")
+            print(f"addrs={','.join(decision.addrs)}")
         if decision.port:
             print(f"port={decision.port}")
         if decision.url:
             print(f"url={decision.url}")
+            print(f"logurl={redact(decision.url)}")
         return 0
     try:
         log(verdict, detail)

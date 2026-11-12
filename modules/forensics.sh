@@ -1,5 +1,6 @@
 # shellcheck shell=bash
 # Forensics: hashing, manifests, verified evidence copies, pcap summaries. Sources are only read.
+# Links/junctions are refused, existing manifests/evidence are never overwritten.
 
 EV="$ROOT/scripts/evidence.py"
 
@@ -19,7 +20,8 @@ verify_file_hash() {
 manifest_create() {
   local d; read -r -e -p 'Directory to hash: ' d
   [ -d "$d" ] || { say 'Directory not found.'; return 0; }
-  "$PY" "$EV" manifest "$d" "$d/MANIFEST.sha256" && audit manifest_create local "$d" RUN "manifest written"
+  audit manifest_create local "$d" RUN "write MANIFEST.sha256" || return 0
+  "$PY" "$EV" manifest "$d" "$d/MANIFEST.sha256"
 }
 
 manifest_verify() {
@@ -35,8 +37,9 @@ evidence_acquire() {
   read -r -e -p "Destination folder [$RESULTS/evidence]: " dest; dest="${dest:-$RESULTS/evidence}"
   read -r -p 'Case ID: ' case; read -r -p 'Examiner name: ' examiner
   [ -n "$case" ] && [ -n "$examiner" ] || { say 'Case ID and examiner are required.'; return 0; }
-  "$PY" "$EV" acquire "$src" "$dest" --case "$case" --examiner "$examiner" && audit evidence_acquire local "$src" RUN "case=$case"
-  say 'Copies are hash-verified and read-only; custody log: custody.jsonl. For disks, image with a write-blocker and ddrescue/dc3dd.'
+  audit evidence_acquire local "$src" RUN "case=$case" || return 0
+  "$PY" "$EV" acquire "$src" "$dest" --case "$case" --examiner "$examiner"
+  say 'Copies are hash-verified and read-only; custody log: custody.jsonl (plain text, not tamper-proof). For disks, image with a write-blocker and ddrescue/dc3dd.'
 }
 
 pcap_summary() {
@@ -53,8 +56,8 @@ file_type() {
 
 reg "Forensics" "SHA-256 of a file" hash_file "python3"
 reg "Forensics" "Verify a file against an expected SHA-256" verify_file_hash "python3"
-reg "Forensics" "Create hash manifest for a folder" manifest_create "python3"
-reg "Forensics" "Verify folder against its manifest" manifest_verify "python3"
+reg "Forensics" "Create hash manifest for a folder (never overwrites)" manifest_create "python3"
+reg "Forensics" "Verify folder against its manifest (fails on extra files)" manifest_verify "python3"
 reg "Forensics" "Acquire evidence copy (verified, read-only, custody log)" evidence_acquire "python3"
 reg "Forensics" "Summarize a pcap (tshark)" pcap_summary "tshark"
 reg "Forensics" "Identify file type (file)" file_type "file"

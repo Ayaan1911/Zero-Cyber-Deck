@@ -1,3 +1,5 @@
+import _isolation  # noqa: F401  (blocks real DNS/network for this process)
+import os
 import subprocess
 import sys
 import tempfile
@@ -6,9 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from scope_guard import approved, evaluate, parse_allowed  # noqa: E402
+from scope_guard import OutOfScope, approved, evaluate, parse_allowed, redact  # noqa: E402
 
 GUARD = ROOT / "scripts" / "scope_guard.py"
+SUPPORT = ROOT / "tests" / "support"
 DNS = {"lab.example": ["192.168.56.10"], "multi.example": ["192.168.56.10", "8.8.8.8"],
        "evil.example": ["8.8.8.8"], "nowhere.example": []}
 
@@ -163,8 +166,15 @@ class UrlTests(Base):
 
 
 class CliTests(Base):
-    def run_guard(self, *args):
-        return subprocess.run([sys.executable, "-I", str(GUARD), *map(str, args)], capture_output=True, text=True)
+    def run_guard(self, *args, fake_dns=""):
+        # Not `-I`: the offline sandbox (fake DNS, blocked connects) is injected through PYTHONPATH/sitecustomize.
+        env = dict(os.environ, PYTHONPATH=str(SUPPORT), ZD_FAKE_DNS=fake_dns, PYTHONDONTWRITEBYTECODE="1",
+                   ZD_DNSLOG=str(Path(self.tmp.name) / "dns.log"))
+        return subprocess.run([sys.executable, str(GUARD), *map(str, args)], capture_output=True, text=True, env=env)
+
+    def dns_log(self):
+        f = Path(self.tmp.name) / "dns.log"
+        return f.read_text().splitlines() if f.exists() else []
 
     def test_in_scope_output_and_audit(self):
         log = Path(self.tmp.name) / "audit.log"
@@ -203,6 +213,90 @@ class CliTests(Base):
         r = self.run_guard(self.path, "validate")
         self.assertEqual(r.returncode, 0)
         self.assertIn("scope OK", r.stdout)
+
+    # --- audit fails closed (finding: audit writes failing open) ---------------------------------------------------
+    def test_audit_path_is_a_directory_fails_closed_before_any_output(self):
+        bad = Path(self.tmp.name) / "auditdir"
+        bad.mkdir()
+        for flags in ((), ("--no-resolve",)):
+            r = self.run_guard("--audit", bad, *flags, self.path, "host", "--", "192.168.56.5")
+            self.assertEqual(r.returncode, 2, flags)
+            self.assertNotIn("IN SCOPE", r.stdout)
+            self.assertIn("failing closed", r.stderr)
+
+    def test_audit_symlink_is_refused(self):
+        from linkutil import make_file_symlink
+        real = Path(self.tmp.name) / "real.log"
+        real.write_text("")
+        link = Path(self.tmp.name) / "audit.log"
+        if not make_file_symlink(link, real):
+            self.skipTest("symlinks not permitted on this machine")
+        r = self.run_guard("--audit", link, self.path, "host", "--", "192.168.56.5")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(real.read_text(), "")
+
+    # --- DNS policy: nothing is resolved before the operator agrees ----------------------------------------------------
+    def test_precheck_makes_no_dns_lookup_and_logs_precheck(self):
+        log = Path(self.tmp.name) / "audit.log"
+        r = self.run_guard("--no-resolve", "--audit", log, self.path, "host", "--", "lab.example", fake_dns="lab.example=192.168.56.10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("host=lab.example", r.stdout)
+        self.assertNotIn("addr=", r.stdout)
+        self.assertEqual(self.dns_log(), [])
+        self.assertEqual(log.read_text().split("\t")[5], "PRECHECK")
+
+    def test_unlisted_name_denied_in_precheck_without_dns(self):
+        r = self.run_guard("--no-resolve", self.path, "host", "--", "other.example", fake_dns="other.example=192.168.56.10")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.dns_log(), [])
+
+    def test_full_check_resolves_once_and_prints_all_verified_addresses(self):
+        r = self.run_guard(self.path, "host", "--", "lab.example", fake_dns="lab.example=192.168.56.10,192.168.56.11")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("addr=192.168.56.10", r.stdout)
+        self.assertIn("addrs=192.168.56.10,192.168.56.11", r.stdout)
+        self.assertEqual(self.dns_log(), ["lookup lab.example"])
+
+    def test_resolution_change_to_out_of_scope_is_denied(self):
+        r = self.run_guard(self.path, "host", "--", "lab.example", fake_dns="lab.example=8.8.8.8")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("outside scope", r.stderr)
+
+    # --- secrets never reach the audit log -----------------------------------------------------------------------------
+    def test_url_secrets_are_redacted_in_every_audit_row(self):
+        log = Path(self.tmp.name) / "audit.log"
+        urls = ["https://192.168.56.5/reset?token=SECRETVALUE&u=1#frag-SECRETVALUE",   # ALLOW
+                "https://8.8.8.8/x?api_key=SECRETVALUE",                                 # DENY
+                "https://user:SECRETVALUE@192.168.56.5/?k=SECRETVALUE",                  # ERROR (credentials)
+                "https://192.168.56.5/a?b=SECRETVALUE c"]                                # ERROR (space)
+        for u in urls:
+            self.run_guard("--audit", log, self.path, "url", "--", u)
+        text = log.read_text()
+        self.assertEqual(len(text.splitlines()), 4)
+        self.assertNotIn("SECRETVALUE", text)
+        self.assertIn("token=REDACTED", text)
+
+    def test_stdout_logurl_is_redacted_but_url_is_usable(self):
+        r = self.run_guard(self.path, "url", "--", "https://192.168.56.5/p?token=SECRETVALUE")
+        self.assertIn("url=https://192.168.56.5/p?token=SECRETVALUE", r.stdout)
+        self.assertIn("logurl=https://192.168.56.5/p?token=REDACTED", r.stdout)
+
+
+class RedactTests(unittest.TestCase):
+    def test_redact(self):
+        cases = {
+            "https://h/p?token=abc&x=1": "https://h/p?token=REDACTED&x=REDACTED",
+            "https://h/p?a=1;b=2": "https://h/p?a=REDACTED;b=REDACTED",
+            "https://user:pw@h/p": "https://REDACTED@h/p",
+            "https://h/p#access_token=zzz": "https://h/p#REDACTED",
+            "https://h/api/v1/reset/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345/confirm": "https://h/api/v1/reset/REDACTED/confirm",
+            "https://h/short/path": "https://h/short/path",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(redact(raw), expected, raw)
+
+    def test_out_of_scope_exception_is_distinct(self):
+        self.assertTrue(issubclass(OutOfScope, Exception) and not issubclass(OutOfScope, ValueError))
 
 
 if __name__ == "__main__":

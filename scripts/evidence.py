@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Hashing, manifests and chain-of-custody copies (stdlib only, Windows + Linux).
+"""Hashing, manifests and chain-of-custody copies (stdlib only, Windows + Linux, Python 3.8+).
 
   evidence.py hash FILE...
   evidence.py verify-file FILE EXPECTED_SHA256
-  evidence.py manifest DIR OUT          sha256sum-compatible manifest
-  evidence.py verify MANIFEST           re-hash files listed relative to the manifest
+  evidence.py manifest DIR OUT          sha256sum-compatible; refuses to overwrite OUT; refuses links/junctions
+  evidence.py verify MANIFEST [--allow-extra]   fails on changed, missing AND unlisted files
   evidence.py acquire SRC DESTDIR --case ID --examiner NAME   verified read-only copy + custody log
-Sources are only ever read.
+Sources are only read. Links, junctions and reparse points are never followed: they are rejected.
+The custody log and manifests are plain files: they document, but do not prevent, tampering.
 """
 from __future__ import annotations
 
@@ -18,6 +19,9 @@ import os
 import shutil
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pathsafe import is_link, reject_links_under  # noqa: E402
 
 CHUNK = 1024 * 1024
 HEX = set("0123456789abcdef")
@@ -35,28 +39,42 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def iter_files(root: Path):
-    for dirpath, dirnames, filenames in os.walk(root):
+def iter_files(root: Path, links: str = "error"):
+    """Yield files under root, never following links. links='error' raises on any link/junction;
+    links='include' yields the link itself (not descended) so callers can report it."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames.sort()
+        keep = []
+        for name in dirnames:
+            full = Path(dirpath) / name
+            if is_link(full):
+                if links == "error":
+                    raise ValueError(f"Refusing link/junction inside the tree: {full}")
+                yield full
+            else:
+                keep.append(name)
+        dirnames[:] = keep
         for name in sorted(filenames):
-            yield Path(dirpath) / name
+            full = Path(dirpath) / name
+            if links == "error" and is_link(full):
+                raise ValueError(f"Refusing link inside the tree: {full}")
+            yield full
 
 
 def write_manifest(directory: Path, out: Path) -> int:
-    if not directory.is_dir():
-        raise ValueError(f"Not a directory: {directory}")
-    out_abs = out.resolve()
-    lines = []
-    for file in iter_files(directory):
-        if file.resolve() == out_abs or file.is_symlink():
-            continue
-        lines.append(f"{sha256_file(file)}  {file.relative_to(directory).as_posix()}")
-    out.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8", newline="\n")
+    if is_link(directory) or not directory.is_dir():
+        raise ValueError(f"Not a plain directory: {directory}")
+    if os.path.lexists(out):
+        raise ValueError(f"Manifest already exists, not overwriting: {out}")
+    lines = [f"{sha256_file(f)}  {f.relative_to(directory).as_posix()}" for f in iter_files(directory)]
+    with out.open("x", encoding="utf-8", newline="\n") as fh:  # exclusive create
+        fh.write("\n".join(lines) + ("\n" if lines else ""))
     return len(lines)
 
 
-def verify_manifest(manifest: Path) -> tuple[list, list, list]:
-    """Return (failed, missing, extra) relative paths. Manifest paths are confined to its directory."""
+def verify_manifest(manifest: Path):
+    """Return (failed, missing, extra) relative paths. Entries are confined to the manifest directory and
+    may not pass through links; anything on disk that the manifest does not list is reported as extra."""
     base = manifest.parent.resolve()
     listed, failed, missing = set(), [], []
     for num, raw in enumerate(manifest.read_text(encoding="utf-8-sig").splitlines(), 1):
@@ -68,38 +86,56 @@ def verify_manifest(manifest: Path) -> tuple[list, list, list]:
         target = (base / rel).resolve()
         if base not in target.parents:
             raise ValueError(f"Manifest line {num} escapes the manifest directory: {rel!r}")
+        reject_links_under(base, rel)
         listed.add(rel)
         if not target.is_file():
             missing.append(rel)
         elif sha256_file(target) != digest.lower():
             failed.append(rel)
-    extra = [f.relative_to(base).as_posix() for f in iter_files(base)
+    extra = [f.relative_to(base).as_posix() for f in iter_files(base, links="include")
              if f.resolve() != manifest.resolve() and f.relative_to(base).as_posix() not in listed]
     return failed, missing, extra
 
 
 def acquire(src: Path, dest_dir: Path, case: str, examiner: str) -> int:
-    """Copy src (file or tree) into dest_dir, verifying hashes; append JSONL custody records."""
-    if not src.exists():
+    """Copy src (file or tree) into dest_dir, verifying hashes; append JSONL custody records.
+    Rejects links anywhere in the source and anywhere under the destination; never overwrites."""
+    if not os.path.lexists(src):
         raise ValueError(f"Source not found: {src}")
+    if is_link(src):
+        raise ValueError(f"Source is a link/junction, refusing: {src}")
+    if is_link(dest_dir):
+        raise ValueError(f"Destination is a link/junction, refusing: {dest_dir}")
     src, dest_dir = src.resolve(), dest_dir.resolve()
     if dest_dir == src or src in dest_dir.parents:
         raise ValueError("Destination must not be inside the source")
-    dest_dir.mkdir(parents=True, exist_ok=True)
     files = [(src, Path(src.name))] if src.is_file() else [(f, Path(src.name) / f.relative_to(src)) for f in iter_files(src)]
+    dest_dir.mkdir(parents=True, exist_ok=True)
     log = dest_dir / "custody.jsonl"
+    if is_link(log):
+        raise ValueError(f"Custody log is a link, refusing: {log}")
     count = 0
     for file, rel in files:
+        reject_links_under(dest_dir, rel.parent)
         target = dest_dir / rel
-        if target.exists():
+        if os.path.lexists(target):
             raise ValueError(f"Refusing to overwrite existing evidence: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        before = sha256_file(file)
-        shutil.copy2(file, target)
-        after = sha256_file(target)
-        if before != after:
-            target.unlink()
-            raise ValueError(f"Hash mismatch copying {file}")
+        reject_links_under(dest_dir, rel.parent)
+        digest = hashlib.sha256()
+        try:
+            with file.open("rb") as reader, target.open("xb") as writer:  # exclusive create: no write-through
+                for block in iter(lambda: reader.read(CHUNK), b""):
+                    digest.update(block)
+                    writer.write(block)
+            shutil.copystat(file, target)
+            after = sha256_file(target)
+            if digest.hexdigest() != after:
+                raise ValueError(f"Hash mismatch copying {file}")
+        except Exception:
+            if target.exists() and not is_link(target):
+                target.unlink()
+            raise
         target.chmod(0o444)
         record = {"time": _now(), "case": case, "examiner": examiner, "source": str(file), "copy": str(target),
                   "sha256": after, "size": target.stat().st_size, "action": "acquire"}
@@ -119,7 +155,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("manifest")
     p.add_argument("directory", type=Path)
     p.add_argument("out", type=Path)
-    sub.add_parser("verify").add_argument("manifest", type=Path)
+    p = sub.add_parser("verify")
+    p.add_argument("manifest", type=Path)
+    p.add_argument("--allow-extra", action="store_true", help="do not fail on files the manifest does not list")
     p = sub.add_parser("acquire")
     p.add_argument("src", type=Path)
     p.add_argument("dest", type=Path)
@@ -141,11 +179,12 @@ def main(argv=None) -> int:
             print(f"Wrote {write_manifest(args.directory, args.out)} entries to {args.out}")
         elif args.cmd == "verify":
             failed, missing, extra = verify_manifest(args.manifest)
-            for label, items in (("FAILED", failed), ("MISSING", missing), ("EXTRA", extra)):
+            for label, items in (("FAILED", failed), ("MISSING", missing), ("UNLISTED", extra)):
                 for item in items:
                     print(f"{label}: {item}")
-            print("VERIFIED" if not (failed or missing) else "VERIFICATION FAILED")
-            return 0 if not (failed or missing) else 1
+            bad = bool(failed or missing or (extra and not args.allow_extra))
+            print("VERIFICATION FAILED" if bad else "VERIFIED")
+            return 1 if bad else 0
         elif args.cmd == "acquire":
             print(f"Acquired {acquire(args.src, args.dest, args.case, args.examiner)} file(s); custody log: {args.dest / 'custody.jsonl'}")
     except (OSError, ValueError) as exc:

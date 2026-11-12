@@ -1,9 +1,11 @@
 # shellcheck shell=bash
 # ZERO Deck shared library: environment, registry, scope gate, logging. Source only; never run directly.
 
-ZD_VERSION="2.0.0"
+ZD_VERSION="2.1.0"
 ROOT="${ZD_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
-SCOPE="${ZD_SCOPE:-$ROOT/config/scope.txt}"
+if [ -n "${ZD_SCOPE:-}" ]; then SCOPE="$ZD_SCOPE"
+elif [ -f "$ROOT/config/scope.local.txt" ]; then SCOPE="$ROOT/config/scope.local.txt"  # untracked: real targets stay out of git
+else SCOPE="$ROOT/config/scope.txt"; fi
 RESULTS="${ZD_RESULTS:-$ROOT/results}"
 NOTES="${ZD_NOTES:-$ROOT/notes}"
 umask 077
@@ -26,14 +28,15 @@ hint() {
   case "$1" in
     python3) echo "sudo apt install python3" ;; nmap) echo "sudo apt install nmap" ;;
     dig) echo "sudo apt install dnsutils" ;; curl) echo "sudo apt install curl" ;;
-    openssl) echo "sudo apt install openssl" ;; timeout) echo "sudo apt install coreutils" ;;
+    openssl) echo "sudo apt install openssl" ;; timeout | tar) echo "sudo apt install coreutils tar" ;;
     wireshark) echo "sudo apt install wireshark" ;; tshark) echo "sudo apt install tshark" ;;
     burpsuite) echo "sudo apt install burpsuite  (or download from portswigger.net)" ;;
     msfconsole) echo "sudo apt install metasploit-framework" ;;
     smartctl) echo "sudo apt install smartmontools" ;; lsblk) echo "sudo apt install util-linux" ;;
     testdisk) echo "sudo apt install testdisk" ;; file) echo "sudo apt install file" ;;
-    ss|ip) echo "sudo apt install iproute2" ;; whois) echo "sudo apt install whois" ;;
-    traceroute) echo "sudo apt install traceroute" ;; gpg) echo "sudo apt install gnupg" ;; tar) echo "sudo apt install tar" ;; *) echo "install '$1' with your package manager" ;;
+    ss | ip) echo "sudo apt install iproute2" ;; whois) echo "sudo apt install whois" ;;
+    traceroute) echo "sudo apt install traceroute" ;; gpg) echo "sudo apt install gnupg" ;;
+    *) echo "install '$1' with your package manager" ;;
   esac
 }
 missing_of() { local t m=(); for t in $1; do have "$t" || m+=("$t"); done; printf '%s' "${m[*]:-}"; }
@@ -43,52 +46,104 @@ need_tool() {
   return 1
 }
 
-# ---- registry: reg <category> <label> <function> [deps...] ---------------------------------
+# ---- registry: reg/regm <category> <label> <function> [deps] ---------------------------------
+# regm registers a MANUAL tool: it is launched interactively and is NOT constrained by the scope gate.
 ZD_CATS=("Network" "Web Security" "Forensics" "Incident Response" "CTF / Learning" "System Recovery" "Utilities")
 ZD_REG=()
 reg() { ZD_REG+=("$1|$2|$3|${4:-}"); }
+regm() { ZD_REG+=("$1|[MANUAL] $2|$3|${4:-}"); }
 
-# ---- audit + scope gate --------------------------------------------------------------------
-audit() { # audit <action> <kind> <target> <verdict> <detail>
-  local clean="${5//[$'\t\r\n']/ }"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-${USERNAME:-unknown}}" \
-    "$1" "$2" "${3//[$'\t\r\n']/ }" "$4" "$clean" >>"$RESULTS/audit.log" 2>/dev/null || true
+# ---- audit log (plain text: records activity, does NOT prevent tampering) ----------------------
+# audit <action> <kind> <target> <verdict> <detail>. Returns 1 when the entry cannot be written: callers MUST stop.
+audit() {
+  local log="$RESULTS/audit.log"
+  if [ -L "$log" ] || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
+    printf 'AUDIT LOG UNUSABLE (%s is a link or not a regular file): refusing to continue.\n' "$log" >&2; return 1
+  fi
+  { printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-${USERNAME:-unknown}}" \
+    "$1" "$2" "${3//[$'\t\r\n']/ }" "$4" "${5//[$'\t\r\n']/ }" >>"$log"; } 2>/dev/null ||
+    { printf 'AUDIT WRITE FAILED (%s): refusing to continue.\n' "$log" >&2; return 1; }
 }
-confirm_yes() { local c; read -r -p "$1 [type YES]: " c || return 1; [ "$c" = YES ]; }
+
+confirm_word() { local c; read -r -p "$2 [type $1]: " c || return 1; [ "$c" = "$1" ]; }
+confirm_yes() { confirm_word YES "$1"; }
 prompt_target() { read -r -p "$1: " TARGET || return 1; [ -n "${TARGET//[[:space:]]/}" ] || { say 'No target supplied.'; return 1; }; }
 
-# gate <host|network|url> <target> <action>; sets G_HOST G_ADDR G_PORT G_URL on success.
-gate() {
-  local kind="$1" target="$2" action="$3" out k v
-  G_HOST=""; G_ADDR=""; G_PORT=""; G_URL=""
-  [ -n "$PY" ] || { say 'Python 3.8+ is required for the scope gate.'; return 1; }
-  say 'Only use on systems you own or have explicit written permission to test.'
-  out="$("$PY" "$ROOT/scripts/scope_guard.py" --audit "$RESULTS/audit.log" --action "$action" "$SCOPE" "$kind" -- "$target")" || return 1
+# ---- unique, never-overwritten outputs --------------------------------------------------------
+unique_file() { # unique_file <dir> <stem> <ext>: atomically claims and prints a new empty file path
+  local dir="$1" stem="$2" ext="$3" n=0 p
+  while [ "$n" -lt 1000 ]; do
+    if [ "$n" -eq 0 ]; then p="$dir/${stem}${ext}"; else p="$dir/${stem}_$n${ext}"; fi
+    if (set -C; : >"$p") 2>/dev/null; then printf '%s' "$p"; return 0; fi
+    n=$((n + 1))
+  done
+  return 1
+}
+unique_dir() { # unique_dir <dir> <stem>: atomically creates and prints a new directory path
+  local n=0 p
+  while [ "$n" -lt 1000 ]; do
+    if [ "$n" -eq 0 ]; then p="$1/$2"; else p="$1/${2}_$n"; fi
+    if mkdir "$p" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+    n=$((n + 1))
+  done
+  return 1
+}
+stamp() { date -u +%Y%m%dT%H%M%SZ; }
+result_path() { unique_file "$RESULTS" "$(stamp)_$1" .txt; }
+
+# ---- scope gate -------------------------------------------------------------------------------------
+_gate_parse() {
+  local k v
   while IFS='=' read -r k v; do
-    case "$k" in host) G_HOST="${v%$'\r'}" ;; addr) G_ADDR="${v%$'\r'}" ;; port) G_PORT="${v%$'\r'}" ;; url) G_URL="${v%$'\r'}" ;; esac
-  done <<<"$out"
-  [ -n "$G_HOST" ] || { say 'Scope gate returned no target.'; return 1; }
-  say "Verified target: $G_HOST${G_ADDR:+ -> $G_ADDR}"
-  if confirm_yes 'Confirm you are authorized for this exact target'; then
-    audit "$action" "$kind" "$G_HOST" CONFIRMED "operator confirmed"; return 0
-  fi
-  audit "$action" "$kind" "$G_HOST" CANCELLED "operator declined"; say 'Cancelled.'; return 1
+    v="${v%$'\r'}"
+    case "$k" in host) G_HOST="$v" ;; addr) G_ADDR="$v" ;; addrs) G_ADDRS="$v" ;; port) G_PORT="$v" ;; url) G_URL="$v" ;; logurl) G_LOGURL="$v" ;; esac
+  done <<<"$1"
 }
 
-result_path() { printf '%s/%s_%s.txt' "$RESULTS" "$(date -u +%Y%m%dT%H%M%SZ)" "$1"; }
-logrun() { # logrun <slug> <command...>
-  local slug="$1" path; shift
-  path="$(result_path "$slug")"
-  say "Running: $*"; audit "$slug" run "${G_HOST:-local}" RUN "$*"
+# gate <host|network|url> <target> <action>
+# 1) static pre-check, NO DNS  2) operator types YES  3) resolve + verify (every answer must be in scope)
+# Sets G_HOST G_ADDR G_ADDRS G_PORT G_URL G_LOGURL (G_URL may hold secrets: only ever display G_LOGURL).
+gate() {
+  local kind="$1" target="$2" action="$3" out
+  G_HOST=""; G_ADDR=""; G_ADDRS=""; G_PORT=""; G_URL=""; G_LOGURL=""
+  [ -n "$PY" ] || { say 'Python 3.8+ is required for the scope gate.'; return 1; }
+  say 'Only use on systems you own or have explicit written permission to test.'
+  out="$("$PY" "$ROOT/scripts/scope_guard.py" --no-resolve --audit "$RESULTS/audit.log" --action "$action" "$SCOPE" "$kind" -- "$target")" || return 1
+  _gate_parse "$out"
+  [ -n "$G_HOST" ] || { say 'Scope gate returned no target.'; return 1; }
+  say "Pre-check passed (no DNS lookup made yet): ${G_LOGURL:-$G_HOST}"
+  if ! confirm_yes 'Confirm you are authorized for this exact target (this also authorizes a DNS lookup of a listed name)'; then
+    audit "$action" "$kind" "${G_LOGURL:-$G_HOST}" CANCELLED "operator declined" || true; say 'Cancelled.'; return 1
+  fi
+  audit "$action" "$kind" "${G_LOGURL:-$G_HOST}" CONFIRMED "operator confirmed" || return 1
+  out="$("$PY" "$ROOT/scripts/scope_guard.py" --audit "$RESULTS/audit.log" --action "$action" "$SCOPE" "$kind" -- "$target")" || return 1
+  _gate_parse "$out"
+  say "Verified target: $G_HOST${G_ADDRS:+ -> $G_ADDRS}"
+}
+
+# logrun <slug> <command...>: audit BEFORE running (fail closed), unique output file, secrets redacted on screen/log.
+logrun() {
+  local slug="$1" path shown; shift
+  path="$(result_path "$slug")" || { say 'Cannot create a result file; refusing to run.'; return 1; }
+  shown="$*"
+  [ -z "${G_URL:-}" ] || shown="${shown//"$G_URL"/"$G_LOGURL"}"
+  audit "$slug" run "${G_HOST:-local}" RUN "$shown" || { rm -f -- "$path"; say 'Not running: the audit entry could not be written.'; return 1; }
+  say "Running: $shown"
+  LAST_RESULT="$path"
   "$@" 2>&1 | tee "$path"
   say "Saved: $path (UNENCRYPTED; treat as sensitive)"
 }
-launch_manual() { # launch_manual <tool> <notice> [args...]
+
+# launch_manual <tool> <notice> [args...]: interactive tools. These are NOT limited by the scope gate.
+launch_manual() {
   local tool="$1" notice="$2"; shift 2
   need_tool "$tool" || return 0
+  printf '%s*** MANUAL TOOL: OUTSIDE THE SCOPE GATE ***%s\n' "${C_BAD:-}" "${C_RST:-}"
+  say "The deck cannot restrict what $tool does or where it connects. You alone are responsible for staying in scope."
+  say "Scope file in use: $SCOPE"
   say "$notice"
-  confirm_yes "Launch $tool" || { say 'Cancelled.'; return 0; }
-  audit "launch_$tool" manual local LAUNCH "interactive session started by operator"
+  confirm_word MANUAL "Type MANUAL to acknowledge and launch $tool" || { say 'Cancelled.'; return 0; }
+  audit "launch_$tool" manual local LAUNCH "interactive tool started by operator (outside scope gate)" || { say 'Not launching: audit log unavailable.'; return 0; }
   "$tool" "$@"
 }
 show_doc() { # show_doc <file>

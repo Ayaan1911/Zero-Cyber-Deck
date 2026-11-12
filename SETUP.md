@@ -19,10 +19,10 @@ Ventoy + Kali **Live** + SystemRescue (+ optional Hiren's BootCD PE, Clonezilla)
 5. **Copy ZERO-Deck (scripted, no admin needed):**
    ```powershell
    .\Install-ZeroDeck.ps1 -DriveLetter E -DryRun     # lists files; writes nothing
-   .\Install-ZeroDeck.ps1 -DriveLetter E             # type COPY; every file is SHA-256 verified after copying
-   .\Install-ZeroDeck.ps1 -DriveLetter E -Update     # later refresh; keeps your scope.txt and notes
+   .\Install-ZeroDeck.ps1 -DriveLetter E             # type COPY; staged, hash-verified, then swapped in
+   .\Install-ZeroDeck.ps1 -DriveLetter E -Update     # replace an existing install; old copy is kept
    ```
-   It refuses non-USB disks, refuses a volume not labelled like Ventoy (override with `-AllowNonVentoyLabel` if you renamed it), never copies `results\`, `.git`, or logs, and never formats or installs anything. If script execution is blocked, copy the folder in File Explorer (skip `results\` and `.git`) instead; do not weaken the system execution policy.
+   How it protects you: files are first copied to `ZERO-Deck.staging-<time>` on the stick and every file is SHA-256 verified; only a fully verified stage is swapped in. With `-Update` the old install is renamed to `ZERO-Deck.bak-<time>` (never deleted; remove it yourself later) and your `results\`, `notes\` and `config\scope*.txt` are carried over; any failure rolls back to the old install. It refuses a destination or parent folder that is a link/junction, skips links found in the source, refuses non-USB disks and volumes not labelled like Ventoy (override with `-AllowNonVentoyLabel` if you renamed it), never copies `results\` contents, `.git`, logs or images, and never formats or installs anything. If you unplug the stick mid-copy, delete any leftover `ZERO-Deck.staging-*` folder. If script execution is blocked, copy the folder in File Explorer (skip `results\` and `.git`) instead; do not weaken the system execution policy.
 
 Expected layout: see `USB-LAYOUT.txt`.
 
@@ -32,7 +32,7 @@ Expected layout: see `USB-LAYOUT.txt`.
 2. If Secure Boot blocks Ventoy, follow Ventoy's current Secure Boot documentation (MOK enrollment). Do not change UEFI settings casually; record what you changed.
 3. In Kali Live open a terminal. Find the data partition (`lsblk -f`, label `Ventoy`); mount it read-write if not auto-mounted: `udisksctl mount -b /dev/<verified-partition>`. **Never run a command on a `/dev/sdX` you have not verified.**
 4. `cd` to the mounted `ZERO-Deck` folder and run `bash zero-deck.sh` (use `bash`; exFAT has no execute bit). Run `bash zero-deck.sh --check` first to see which tools exist.
-5. Edit `config/scope.txt` with ONLY your authorized lab targets (list a lab hostname **and** its IP). Test with local inventory first; then your own lab.
+5. Create `config/scope.local.txt` (it takes precedence and is git-ignored; leave `config/scope.txt` as the empty template) with ONLY your authorized lab targets (list a lab hostname **and** its IP). Test with local inventory first; then your own lab. Wireshark, Burp, Metasploit and TestDisk are **[MANUAL]** items: the scope gate cannot constrain them.
 
 Keys in the dashboard: arrows or `j`/`k` move, `Enter` selects, `1`-`9` jump, `q`/Esc goes back. `bash zero-deck.sh --plain` uses numbered menus.
 
@@ -59,7 +59,7 @@ Ventoy persistence docs: https://www.ventoy.net/en/plugin_persistence.html ; Kal
 - Kali won't boot: check ISO checksum, UEFI/Secure Boot, newer Ventoy, try SystemRescue to isolate hardware issues.
 - Files vanish after reboot: you used non-persistent Live; save to the mounted data partition.
 - `Missing tool`: the dashboard shows the apt package. `bash setup-kali.sh` prints the optional package list (dry run) and installs only with `--install` plus typing INSTALL. Installs in Live mode vanish at reboot.
-- `OUT OF SCOPE` / `SCOPE ERROR`: edit `config/scope.txt` (see rules inside). Never add a target just to get past the check.
+- `OUT OF SCOPE` / `SCOPE ERROR`: edit your scope file (`config/scope.local.txt`; rules are in the template `config/scope.txt`). Never add a target just to get past the check.
 - A hostname is refused although listed: its resolved IPs must be listed too (shown in the message).
 - Windows won't run `.ps1`: use `powershell -NoProfile -ExecutionPolicy Bypass -File ...` for that single run, or copy via Explorer.
 - Extremely slow boots: expected on USB 2.0.

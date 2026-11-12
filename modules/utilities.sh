@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# Utilities: dependency check, scope management, self-test.
+# Utilities: dependency check, scope management, self-test, encrypted results archive.
 
-deps_report() { # returns non-zero when a core dependency is missing
+deps_report() { # returns non-zero when a core dependency is missing; see docs/DEPENDENCIES.md
   local t core_missing=0
   for t in bash python3 nmap dig curl openssl timeout tshark wireshark burpsuite msfconsole smartctl lsblk testdisk file gpg tar; do
     if have "$t"; then printf '[ok]      %-11s\n' "$t"
@@ -15,21 +15,22 @@ deps_report() { # returns non-zero when a core dependency is missing
 }
 
 show_scope() {
-  say "Scope file: $SCOPE"
-  "$PY" "$ROOT/scripts/scope_guard.py" "$SCOPE" validate || say 'Fix config/scope.txt before using gated actions.'
+  say "Scope file in use: $SCOPE"
+  "$PY" "$ROOT/scripts/scope_guard.py" "$SCOPE" validate || say 'Fix the scope file before using gated actions.'
   grep -v '^[[:space:]]*\(#\|$\)' "$SCOPE" 2>/dev/null || say '(no entries)'
 }
 
 self_test() { bash "$ROOT/scripts/test-deck.sh"; }
 
-# Symmetric AES-256 gpg archive of results/. Output goes OUTSIDE results/ so it is not archived into itself.
+# Symmetric AES-256 gpg archive of results/. Output goes OUTSIDE results/ and never overwrites an existing archive.
 encrypt_results() {
-  local out; out="$ROOT/results_$(date -u +%Y%m%dT%H%M%SZ).tar.gz.gpg"
+  local out
+  audit encrypt_results local "$RESULTS" RUN "gpg archive" || return 0
+  out="$(unique_file "${ZD_ARCHIVE_DIR:-$ROOT}" "results_$(stamp)" .tar.gz.gpg)" || { say 'Cannot create archive file.'; return 0; }
+  rm -f -- "$out"  # gpg refuses to overwrite silently; the name is unique so remove only our empty placeholder
   say "Archiving $RESULTS -> $out (you will be asked for a passphrase; remember it, there is no recovery)."
-  tar -C "$RESULTS" -czf - . | gpg --symmetric --cipher-algo AES256 -o "$out" && {
-    audit encrypt_results local "$out" RUN "encrypted archive created"
+  tar -C "$RESULTS" -czf - . | gpg --symmetric --cipher-algo AES256 -o "$out" &&
     say "Created $out. Verify it decrypts before deleting the plaintext results."
-  }
 }
 
 reg "Utilities" "Check installed tools + install hints" deps_report ""

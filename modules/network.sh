@@ -1,15 +1,16 @@
 # shellcheck shell=bash
-# Network: inventory, scope-gated Nmap workflows, Wireshark, Metasploit (manual).
+# Network: inventory, scope-gated Nmap workflows, Wireshark and Metasploit (MANUAL, outside the scope gate).
 
 local_inventory() {
-  local path; path="$(result_path local_inventory)"
+  local path
+  audit local_inventory local local RUN "read-only local inventory" || return 0
+  path="$(result_path local_inventory)" || { say 'Cannot create a result file.'; return 0; }
   {
     date -u; uname -a
     have ip && { ip -brief address; ip route; }
     have ss && ss -tuln
     have df && df -h "$ROOT"
   } 2>&1 | tee "$path"
-  audit local_inventory local local RUN "read-only local inventory"
   say "Saved: $path (UNENCRYPTED)"
 }
 
@@ -21,6 +22,7 @@ nmap_discovery() {
 nmap_top_ports() {
   prompt_target 'Enter AUTHORIZED single IP or hostname' && gate host "$TARGET" nmap_top_ports || return 0
   say "Scanning the verified address $G_ADDR (not a fresh DNS lookup)."
+  [ "$G_ADDR" = "$G_ADDRS" ] || say "Note: $G_HOST has several verified addresses ($G_ADDRS); only the first is scanned. Re-run per address if needed."
   logrun service_inventory nmap -sT -sV --version-light --top-ports 100 --open --host-timeout 5m --max-retries 2 "$G_ADDR"
 }
 
@@ -44,18 +46,19 @@ nmap_custom_ports() {
 }
 
 wireshark_launch() {
-  launch_manual wireshark 'Wireshark: capture only on networks you are authorized to monitor. Captures may contain credentials; store them encrypted.'
+  launch_manual wireshark 'Capture only on networks you are authorized to monitor. Captures may contain credentials; store them encrypted.'
 }
 
 metasploit_launch() {
-  say 'Current authorized scope:'; grep -v '^[[:space:]]*\(#\|$\)' "$SCOPE" 2>/dev/null || say '  (empty)'
-  launch_manual msfconsole "Metasploit starts as an INTERACTIVE console. Nothing runs automatically.
-Use only against lab systems listed above. Tip inside msfconsole: spool $RESULTS/msf_session.log" -q
+  say 'Authorized scope listed in the scope file (Metasploit will NOT check it):'
+  grep -v '^[[:space:]]*\(#\|$\)' "$SCOPE" 2>/dev/null || say '  (empty)'
+  launch_manual msfconsole "Interactive console only; nothing runs automatically. Set RHOSTS only to systems listed above.
+Tip inside msfconsole: spool $RESULTS/msf_session.log" -q
 }
 
 reg "Network" "Local system + network inventory" local_inventory ""
 reg "Network" "Discover LAN hosts (Nmap -sn, /24 max)" nmap_discovery "nmap python3"
 reg "Network" "Top-100 TCP port + service inventory (Nmap)" nmap_top_ports "nmap python3"
 reg "Network" "Custom port list (Nmap, validated)" nmap_custom_ports "nmap python3"
-reg "Network" "Open Wireshark (manual)" wireshark_launch "wireshark"
-reg "Network" "Open Metasploit console (manual, lab only)" metasploit_launch "msfconsole"
+regm "Network" "Wireshark" wireshark_launch "wireshark"
+regm "Network" "Metasploit console (lab only)" metasploit_launch "msfconsole"

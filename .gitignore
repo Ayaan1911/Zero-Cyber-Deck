@@ -1,15 +1,70 @@
+# ---- session output, case evidence, operator data: NEVER commit -------------------------------------
 results/*
 !results/README.md
-*.dat
+notes/*
+!notes/README.md
+evidence/
+cases/
+case_*/
+triage_*/
+custody.jsonl
+MANIFEST.sha256
+results_*.tar.gz
+results_*.tar.gz.gpg
+*.gpg
+# real targets live in an untracked file; config/scope.txt stays the empty template
+config/scope.local.txt
+
+# ---- images, persistence backends, captures, downloaded media ----------------------------------------
 *.iso
 *.img
+*.dat
+*.wim
 *.vhd
 *.vhdx
+*.vmdk
+*.ova
 *.qcow2
 *.pcap
 *.pcapng
-*.log
+*.cap
+persistence/
+ISO/
+ventoy/
+
+# ---- secrets and credentials --------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+*.ovpn
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+
+# ---- python / tooling ---------------------------------------------------------------------------------
 __pycache__/
 *.pyc
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ---- installer staging/backups, logs, editors, OS -------------------------------------------------------
+ZERO-Deck.staging-*/
+ZERO-Deck.bak-*/
+*.log
+*.swp
+.idea/
+.vscode/
 .DS_Store
-*.gpg
+Thumbs.db
