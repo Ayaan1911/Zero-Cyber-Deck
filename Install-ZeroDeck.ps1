@@ -295,6 +295,10 @@ function Invoke-Deploy {
     Write-Host "Application:   $destination$(if (Test-Path -LiteralPath $destination) { '  (exists: -Update required; the old copy is kept as ZERO-Deck.bak-<time>)' })"
     Write-Host "Data folder:   $dataDir  - $($dataState.Message). It is never modified by this script."
     Write-Host "USB disk:      $($disk.FriendlyName), $([math]::Round($disk.Size / 1GB, 1)) GiB, disk number $($disk.Number), label '$($volume.FileSystemLabel)', $($volume.FileSystem)"
+    if ("$($volume.FileSystem)" -match '^(exFAT|FAT32|FAT)$') {
+        Write-Host ("NOTE: this volume is $($volume.FileSystem). It has no hard links or permissions, so the Linux side of ZERO Deck REFUSES to initialise a data folder here or to write evidence, manifests or reports to it. " +
+                    "Keep the application here, but put the Linux ZERO-DATA on an ext4 (or NTFS) location and point ZD_DATA at it - see SETUP.md 'Storage layout'.") -ForegroundColor Yellow
+    }
     if (Test-Path -LiteralPath $destination) {
         $legacy = @(Get-LegacyDataFindings $destination)
         if ($legacy.Count -gt 0) { Write-Host "LEGACY DATA inside the old application folder ($($legacy.Count) item(s)): it will NOT be carried over. Migrate it first (SETUP.md) or pass -AcknowledgeLegacyData." -ForegroundColor Yellow }

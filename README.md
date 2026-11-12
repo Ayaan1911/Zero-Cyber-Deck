@@ -112,6 +112,7 @@ Run `bash scripts/test-deck.sh` (or `python -B -I -m unittest discover -s tests`
 
 ## Known limitations and security notes
 
+- **exFAT/FAT32 cannot hold ZERO-DATA on Linux.** They have no hard links, which the safe publish step requires, so `--init-data`, evidence acquisition, manifests, reports and migration are **refused there with a diagnostic** (`scripts/fscaps.py`, `bash zero-deck.sh --check`) rather than falling back to a weaker method. Keep the application on exFAT; put the Linux `ZERO-DATA` on ext4 (SETUP.md 'Storage layout'). Hard-link failure is only simulated in the offline tests; real exFAT is not tested yet (docs/KALI-VM-CHECKLIST.md).
 - **Results are plaintext** on the (usually exFAT) stick. `chmod`/`umask` do nothing on exFAT. Encrypt with the Utilities gpg item before moving data off the stick. Ventoy provides no encrypted persistence.
 - Triage snapshots (`ps`, sockets) can contain secrets; treat as sensitive.
 - Redaction is best-effort: it covers the whole query, fragments, userinfo, path parameters and long token-like path segments, not every possible secret location.

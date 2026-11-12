@@ -44,6 +44,26 @@ Ventoy + Kali **Live** + SystemRescue (+ optional Hiren's BootCD PE, Clonezilla)
 
 Expected layout: see `USB-LAYOUT.txt`.
 
+## 1b. Storage layout (Ventoy exFAT + a separate ext4 ZERO-DATA) - a plan, not yet built or tested
+
+**Why.** The Linux side publishes every evidence file, manifest, report and migrated file with `link()` (a hard link), so a half-written file can never appear under its final name and an existing file is never replaced. **exFAT, FAT32 and many network filesystems have no hard links**, and Ventoy's big data partition is exFAT by default. Instead of weakening the publish step, ZERO Deck **refuses** to initialise a data folder, acquire evidence, write manifests or reports, or migrate data on a filesystem that cannot do it, with a message that names the cause (`python3 scripts/fscaps.py probe ...` and `bash zero-deck.sh --check` show the details). exFAT also has no permissions (`chmod` is silently ignored, so a "read-only" evidence copy is not protected), no journal and unstable inode numbers.
+
+**Recommended layout (nothing here has been created; this project made and formatted no partition):**
+
+| Partition | Filesystem | Holds |
+|---|---|---|
+| Ventoy data partition (large) | exFAT (Ventoy default) | `ISO/`, `ZERO-Deck/` (application code only: needs no hard links and no permissions) |
+| Ventoy EFI partition (~32 MB, `VTOYEFI`) | FAT | Ventoy's boot files. **Leave it exactly as Ventoy created it.** |
+| An extra partition you add yourself | ext4 (label e.g. `ZERODATA`) | the Linux `ZERO-DATA` (results, notes, evidence, `config/scope.local.txt`, audit log) |
+
+Ventoy keeps its EFI partition at the end of the disk, so an extra ext4 partition means shrinking the data partition and placing the new one in front of the EFI partition. Do that with Linux tools on a disposable test stick first (resizing a partition table can destroy data) and follow Ventoy's own disk-layout documentation; this project does not do it for you. A second USB stick, or an ext4 folder on the laptop's disk, works equally well and is safer to start with.
+
+**Using it on Kali:** mount the ext4 partition so that your user can write to it, then run `ZD_DATA=<mountpoint>/ZERO-DATA bash zero-deck.sh --init-data` and use the same `ZD_DATA` for every later command. ext4 honours permissions, so an evidence copy really is read-only. `--init-data` probes the filesystem first and refuses (removing only the empty folder it created itself) if safe publishing is impossible.
+
+**Windows cannot read ext4 without third-party drivers.** Do not install such a driver on a machine you care about just for this, and when Windows says an ext4 partition "needs to be formatted", choose Cancel: that is Windows not recognising it, not damage. Windows data therefore lives in its own **Windows ZERO-DATA on NTFS** (an internal drive is best; if the USB is exFAT, point `ZD_DATA` at an internal NTFS folder). The Windows backend never uses hard links, but exFAT still has no permissions, no journal and reused inode numbers, and its sharing semantics are untested, so treat Windows data on exFAT as convenience storage, not protected evidence. To move results between the systems, copy them as a **verified copy** (compare `sha256sum` before and after) and re-create the manifest on the destination. Everything on exFAT stays plaintext: encrypt it before it leaves your hands.
+
+Two systems must not write to the same ZERO-DATA at the same time.
+
 ## 2. Boot your ASUS laptop (manual)
 
 1. With the USB inserted, restart and open the ASUS boot menu (often **Esc** or **F8**, model dependent). Choose the USB, then the Kali **Live** ISO in the Ventoy menu.

@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import datadir  # noqa: E402
+import fscaps  # noqa: E402
 import safefs  # noqa: E402
 
 _after_copy_hook = None  # test seam: called after copying, before the source is re-verified. None in production.
@@ -98,6 +99,8 @@ def migrate(old_app, data_dir, dry_run: bool = False, app_root=None):
     elif state != "ok":
         raise ValueError(msg)
     summary = {"copied": [], "skipped": [], "conflicts": []}
+    if not dry_run and not dry_missing:
+        fscaps.require_publish_at(data_dir)  # refuse before reading the legacy folder if the data folder's filesystem cannot publish safely
     with safefs.open_dir(old_app) as old_root:
         items = plan(old_root)
         if dry_missing:  # everything would be copied

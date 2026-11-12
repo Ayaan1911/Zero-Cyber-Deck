@@ -132,6 +132,12 @@ class _DirBase:
 if not _WIN:
     _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
+    # errno values that mean "this filesystem has no hard links" (the Linux VFS returns EPERM when a filesystem has no link op)
+    NO_HARDLINK_ERRNOS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS}
+    HARDLINK_HELP = ("This folder ({path}) is on a filesystem that does not support hard links (error {errno}). exFAT, FAT32 and some network "
+                     "filesystems do not, and the safe publish step requires them. Evidence, manifests, reports and migration are refused here "
+                     "so that nothing is written with weaker guarantees. Use a folder on ext4, XFS, btrfs or NTFS (see SETUP.md 'Storage layout').")
+
     def _posix_supported() -> Optional[str]:
         if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
             return "this platform has no O_NOFOLLOW/O_DIRECTORY"
@@ -171,6 +177,10 @@ if not _WIN:
                 os.link(self._tmp, self.name, src_dir_fd=self._parent._fd, dst_dir_fd=self._parent._fd, follow_symlinks=False)
             except FileExistsError:
                 raise
+            except OSError as exc:
+                if exc.errno in NO_HARDLINK_ERRNOS:  # exFAT/FAT32/some network filesystems: a clear diagnostic, never a bare EPERM
+                    raise UnsupportedConfigurationError(HARDLINK_HELP.format(path=self._parent.path, errno=errno.errorcode.get(exc.errno, exc.errno))) from None
+                raise
             self._unlink_if_ours()
             self.fh.close()
             self.committed = True
@@ -185,14 +195,31 @@ if not _WIN:
             # else: the name now refers to something that is NOT ours -> leave it untouched
 
         def discard(self) -> None:
+            # Unlink BEFORE closing: while our descriptor is open the inode is pinned in memory, so the name->inode identity
+            # check is reliable even on filesystems that give a file a NEW inode number when it is re-read from disk (exFAT
+            # assigns i_ino from a runtime counter). Closing first could make our own temporary file look "not ours" and
+            # leave it behind. Replacement protection is unchanged: a different object at the name never matches.
             try:
-                self.fh.close()
-            finally:
                 self._unlink_if_ours()
+            finally:
+                self.fh.close()
 
     class _PosixDir(_DirBase):
         def __init__(self, fd: int, path: str):
             self._fd, self.path = fd, path
+
+        @property
+        def fd(self) -> int:
+            """The held directory descriptor (for the capability probe, which must exercise the real *at() primitives)."""
+            return self._fd
+
+        def remove_file(self, name: str) -> None:
+            """Remove a file, or a link ITSELF (never what it points to), relative to this held directory."""
+            os.unlink(check_name(name), dir_fd=self._fd)
+
+        def remove_dir(self, name: str) -> None:
+            """Remove an EMPTY directory relative to this held directory (the OS refuses if it is not empty)."""
+            os.rmdir(check_name(name), dir_fd=self._fd)
 
         def close(self) -> None:
             if self._fd is not None:
@@ -467,6 +494,14 @@ if _WIN:
             except FileNotFoundError:
                 return "missing"
             return "link" if attrs & _ATTR_REPARSE else "dir" if attrs & _ATTR_DIR else "file"
+
+        def remove_file(self, name: str) -> None:
+            """Remove a file, or a link ITSELF, under this held directory (its ancestors cannot be swapped while we hold it)."""
+            os.remove(os.path.join(self.path, check_name(name)))
+
+        def remove_dir(self, name: str) -> None:
+            """Remove an EMPTY directory (rmdir; a junction is removed itself, never its target). Close any handle on it first."""
+            os.rmdir(os.path.join(self.path, check_name(name)))
 
         def open_read(self, name: str):
             path = os.path.join(self.path, check_name(name))

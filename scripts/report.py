@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fscaps  # noqa: E402
 import safefs  # noqa: E402
 
 AUDIT_TAIL = 50
@@ -98,6 +99,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
+        fscaps.require_publish_at(safefs.abs_path(args.out).parent if args.out else args.results)  # refuse before reading anything
         text = build_report(args.results, args.scope, args.title, args.operator)
         if args.out:
             out_abs = safefs.abs_path(args.out)

@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fscaps  # noqa: E402
 import safefs  # noqa: E402
 from safefs import abs_path, sha256_file  # noqa: E402,F401  (sha256_file re-exported for callers/tests)
 
@@ -50,6 +51,7 @@ def _not_found(exc: Exception, what: str) -> ValueError:
 def write_manifest(directory, out) -> int:
     """Hash every file under `directory` (links are refused) and write a NEW manifest at `out` (never overwrites)."""
     directory, out = abs_path(directory), abs_path(out)
+    fscaps.require_publish_at(out.parent)  # refuse BEFORE reading or creating anything if this filesystem cannot publish safely
     lines = []
     try:
         with safefs.open_dir(directory) as root:
@@ -166,6 +168,7 @@ def acquire(src, dest_dir, case: str, examiner: str) -> int:
     src_abs, dest_abs = abs_path(src), abs_path(dest_dir)
     if dest_abs == src_abs or src_abs in dest_abs.parents:
         raise ValueError("Destination must not be inside the source")
+    fscaps.require_publish_at(dest_abs)  # refuse BEFORE anything is created if this filesystem cannot publish safely (e.g. exFAT)
     try:
         sp = safefs.open_dir(src_abs.parent)
     except FileNotFoundError as exc:

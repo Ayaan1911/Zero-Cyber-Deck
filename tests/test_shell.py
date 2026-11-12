@@ -688,6 +688,44 @@ class DataFolderLifecycleTests(ShellCase):
         self.assertEqual((fake_root / "results" / "old_case.txt").read_text(), "EVIDENCE")
 
 
+class FilesystemCapabilityShellTests(ShellCase):
+    """--init-data / --check on a filesystem WITHOUT hard links (exFAT/FAT32), simulated by making os.link() fail with EPERM."""
+    INIT_DATA = False
+
+    def run_deck(self, flag, no_links):
+        env = dict(os.environ, ZD_DATA=self.data.as_posix(), PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(SUPPORT))
+        if no_links:
+            env["ZD_TEST_NO_HARDLINKS"] = "1"
+        return subprocess.run([BASH, (ROOT / "zero-deck.sh").as_posix(), flag], capture_output=True, text=True, env=env, timeout=120)
+
+    @unittest.skipIf(sys.platform == "win32", "hard-link behaviour is POSIX-only")
+    def test_init_data_refuses_without_hard_links_and_leaves_no_half_initialised_folder(self):
+        r = self.run_deck("--init-data", True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hard links", r.stdout + r.stderr)
+        self.assertIn("ext4", r.stdout + r.stderr)
+        self.assertFalse(self.data.exists(), "a broken ZERO-DATA was left behind")
+
+    @unittest.skipIf(sys.platform == "win32", "hard-link behaviour is POSIX-only")
+    def test_check_reports_publish_unavailable_on_an_existing_data_folder_without_hard_links(self):
+        self.assertEqual(self.run_deck("--init-data", False).returncode, 0)
+        r = self.run_deck("--check", True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Publish capability: UNAVAILABLE", r.stdout)
+        r = self.run_deck("--check", False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Publish capability: OK", r.stdout)
+
+    def test_interrupted_init_is_reported_as_partial_and_repaired_by_init_data(self):
+        for sub in ("results", "notes"):
+            (self.data / sub).mkdir(parents=True)
+        r = self.run_deck("--check", False)
+        self.assertIn("interrupted initialization", r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.run_deck("--init-data", False).returncode, 0)
+        self.assertEqual(self.run_deck("--check", False).returncode, 0)
+
+
 class ApplicationFolderUntouchedTests(ShellCase):
     """Audited failure 6 (architecture): code and data are separate, so the application folder always matches its manifest."""
 

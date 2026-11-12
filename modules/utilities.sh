@@ -22,10 +22,26 @@ show_scope() {
 
 self_test() { bash "$ROOT/scripts/test-deck.sh"; }
 
+# Rehearses the exact publish sequence (zero-byte file) in the results folder. Sets PUBLISH_OK=1/0. Evidence, manifests, reports and
+# migration need hard links; exFAT/FAT32 have none, so they are refused there instead of failing halfway.
+publish_capability() {
+  PUBLISH_OK=0
+  [ "$DATA_READY" = 1 ] || return 1
+  local out
+  if out="$("$PY" "$ROOT/scripts/fscaps.py" rehearse --dir "$RESULTS" 2>&1)"; then
+    PUBLISH_OK=1; say "Publish capability: OK - $out"
+  else
+    say "Publish capability: UNAVAILABLE - evidence, manifests, reports and migration will be refused on this filesystem."
+    say "$out"
+  fi
+  [ "$PUBLISH_OK" = 1 ]
+}
+
 data_status() {
   say "Application folder (code only, never written): $ROOT"
   say "Data folder (results, notes, evidence, scope, audit log): $DATA"
-  if [ "$DATA_READY" = 1 ]; then say "Status: READY - $DATA_MSG"; else say "Status: NOT READY - $DATA_MSG"; say "Initialize it once with:  bash zero-deck.sh --init-data"; fi
+  if [ "$DATA_READY" = 1 ]; then say "Status: READY - $DATA_MSG"; else say "Status: NOT READY - $DATA_MSG"; say "Initialize or repair it with:  bash zero-deck.sh --init-data"; fi
+  publish_capability || true
   legacy_data_present && say "NOTE: operator files were found INSIDE the application folder (old layout). They are not used. Copy them with: $PY scripts/migrate_data.py --from \"$ROOT\" --to \"$DATA\"   (see SETUP.md; back up first)"
   return 0
 }

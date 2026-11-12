@@ -159,6 +159,19 @@ class DocsTests(unittest.TestCase):  # audit item 13
             self.assertIn(needle, setup, f"SETUP.md should document: {needle}")
         self.assertNotIn("carried over", setup.split("## 2.")[0].replace("never carried", ""), "the updater no longer carries user data over")
 
+    def test_docs_describe_exfat_limits_storage_layout_and_the_vm_checklist(self):
+        setup = (ROOT / "SETUP.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        checklist = (ROOT / "docs" / "KALI-VM-CHECKLIST.md").read_text(encoding="utf-8")
+        for needle in ("Storage layout", "hard links", "ext4", "VTOYEFI", "Leave it exactly as Ventoy created it", "Windows cannot read ext4",
+                       "verified copy", "not yet built or tested"):
+            self.assertIn(needle, setup, f"SETUP.md should document: {needle}")
+        for needle in ("exFAT/FAT32 cannot hold ZERO-DATA", "refused", "real exFAT is not tested"):
+            self.assertIn(needle, readme, f"README should document: {needle}")
+        for needle in ("python3 --version", "--init-data", "fscaps.py probe", "--approve-disposable-dir", "UNSUPPORTED filesystem", "clean", "Stop conditions"):
+            self.assertIn(needle, checklist, f"KALI-VM-CHECKLIST.md should cover: {needle}")
+        self.assertNotIn("Install Kali", checklist.replace("Nothing here installs Kali", ""))
+
     def test_readme_links_dependency_doc_and_states_python_floor(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("docs/DEPENDENCIES.md", readme)

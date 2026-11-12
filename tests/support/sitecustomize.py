@@ -32,3 +32,15 @@ socket.gethostbyname = _blocked
 socket.create_connection = _blocked
 socket.socket.connect = _blocked
 socket.socket.connect_ex = lambda *_a, **_k: 1
+
+
+# ZD_TEST_NO_HARDLINKS=1 makes os.link() fail with EPERM, exactly like the Linux VFS does on exFAT/FAT32 (no link operation).
+# The wrapper is registered in os.supports_* so the API-level capability check still passes: only the FILESYSTEM operation fails.
+if os.environ.get("ZD_TEST_NO_HARDLINKS") == "1" and hasattr(os, "link"):
+    import errno as _errno
+
+    def _no_hardlinks(*_a, **_k):
+        raise OSError(_errno.EPERM, "Operation not permitted")
+    os.link = _no_hardlinks
+    getattr(os, "supports_dir_fd", set()).add(_no_hardlinks)
+    getattr(os, "supports_follow_symlinks", set()).add(_no_hardlinks)

@@ -7,3 +7,6 @@ Large Ventoy data partition (typically exFAT):
 `- persistence/           (optional Kali backend .dat file, created manually on Linux)
 
 The USB is NOT formatted or bootable just by copying this project to it.
+
+PLANNED (not built): the Linux ZERO-DATA belongs on an ext4 partition, not on the exFAT partition above (exFAT has no hard links,
+so the Linux side refuses to use it for data). Leave Ventoy's EFI partition (VTOYEFI) unchanged. See SETUP.md "Storage layout".

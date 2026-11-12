@@ -49,3 +49,6 @@ Nothing is installed automatically. `bash setup-kali.sh` prints the small option
 
 - Python 3.8 is the floor: no `match`, no `X | Y` at runtime, no `Path.write_text(newline=)` (3.10+), no `removeprefix`. `tests/test_py38_compat.py` enforces this statically (an interpreter older than 3.11 was not available when this was written).
 - Windows file symlinks need a privilege ordinary users often lack; junctions do not. The deck rejects both. Tests that need real file symlinks are skipped where they cannot be created.
+
+## Filesystem requirements for ZERO-DATA (Linux)
+The data folder, and any folder that receives evidence, manifests, reports or migrated files, must be on a filesystem with **hard links, exclusive create and no-follow opens** (ext4, XFS, btrfs, tmpfs; NTFS through a Linux driver is *unverified*). exFAT and FAT32 have no hard links and are refused. Check with `bash zero-deck.sh --check` or `python3 scripts/fscaps.py probe --dir <disposable folder> --approve-disposable-dir`. First real-VM steps: `docs/KALI-VM-CHECKLIST.md`.

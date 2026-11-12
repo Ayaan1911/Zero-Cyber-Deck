@@ -148,6 +148,11 @@ function Test-Deck {
         if ($LASTEXITCODE -ne 0) { $bad++; $report += "[invalid] scope file $Scope : $validation" } else { $report += "[ok]      $validation" }
     }
     if ($DataReady) { $report += "[ok]      data folder: $DataMessage" } else { $report += "[problem] data folder not ready: $DataMessage  -> run: .\Start-ZeroDeck.ps1 -InitData"; $bad++ }
+    if ($DataReady -and $Py) {
+        # the exact publish sequence on a zero-byte file: evidence, manifests and reports cannot be written safely where this fails
+        $rehearsal = (& $Py (Join-Path $Root 'scripts\fscaps.py') rehearse --dir $Results 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0) { $report += "[ok]      $rehearsal" } else { $report += "[problem] safe publishing is unavailable here: $rehearsal"; $bad++ }
+    }
     $report | Out-Host
     return $bad
 }
