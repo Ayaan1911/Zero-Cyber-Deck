@@ -1,107 +1,239 @@
 #!/usr/bin/env python3
-"""Explicit scope gate for ZERO CyberSec Deck interactive diagnostics.
+"""Scope gate for ZERO CyberSec Deck: the single policy engine for Kali and Windows.
 
-This gate is a guardrail, not proof of permission or a security boundary.
+A guardrail, not proof of permission. Rules:
+  * scope entries (IPv4 / IPv4 CIDR no broader than /24 / exact FQDN) come from config/scope.txt
+  * a hostname must be listed AND every IPv4 address it resolves to must fall inside a
+    listed network, so DNS can never widen scope
+  * the CLI prints the normalized, pinned values the caller must use (key=value lines)
+  * every decision can be appended to an audit log (fail closed if it cannot be written)
 """
 from __future__ import annotations
 
 import argparse
+import datetime
+import getpass
+import hashlib
 import ipaddress
 import re
+import socket
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
+URL_BAD_RE = re.compile(r"[^\x21-\x7e]|[\\\[\]{}<>^`|\"']")  # non-printable, whitespace, curl globs, quotes
+MAX_ADDRESSES = 256  # /24
+
+
+class OutOfScope(Exception):
+    """Target is syntactically valid but not authorised."""
+
+
+@dataclass(frozen=True)
+class Decision:
+    host: str                     # normalized IP, FQDN, or CIDR
+    addrs: tuple[str, ...] = ()   # IPv4 addresses to connect to (all verified in scope)
+    port: int | None = None
+    url: str = ""                 # normalized URL (kind == url)
+
+
+Resolver = Callable[[str], list]
+
+
+def resolve_ipv4(host: str) -> list:
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as err:
+        raise ValueError(f"Cannot resolve {host}: {err}") from err
+    return sorted({info[4][0] for info in infos})
+
+
+def _is_fqdn(host: str) -> bool:
+    return bool(HOST_RE.fullmatch(host)) and "." in host and not host.rsplit(".", 1)[1].isdigit()
+
+
+def _network(text: str):
+    try:
+        return ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return None
 
 
 def parse_allowed(path: Path):
-    networks = []
-    domains = set()
     if not path.is_file():
         raise ValueError(f"Scope file not found: {path}")
-    for rownum, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        text = path.read_bytes().decode("utf-8-sig")  # tolerate a Notepad BOM
+    except UnicodeDecodeError as err:
+        raise ValueError("Scope file is not valid UTF-8") from err
+    networks, domains = [], set()
+    for rownum, raw in enumerate(text.splitlines(), 1):
         line = raw.partition("#")[0].strip().lower().rstrip(".")
         if not line:
             continue
-        try:
-            network = ipaddress.ip_network(line, strict=False)
-            if network.version != 4:
-                raise ValueError("IPv6 is not supported in v1")
-            networks.append(network)
-            continue
-        except ValueError as err:
-            if "IPv6 is not supported" in str(err):
-                raise ValueError(f"Line {rownum}: {err}") from err
-        if not HOST_RE.fullmatch(line) or "." not in line or line.startswith("-"):
+        net = _network(line)
+        if net is not None:
+            if net.version != 4:
+                raise ValueError(f"Line {rownum}: IPv6 is not supported")
+            if net.num_addresses > MAX_ADDRESSES:
+                raise ValueError(f"Line {rownum}: {line} is broader than /24")
+            networks.append(net)
+        elif _is_fqdn(line):
+            domains.add(line)
+        else:
             raise ValueError(f"Line {rownum}: invalid scope entry {line!r}")
-        domains.add(line)
     return networks, domains
 
 
-def valid_host(host: str) -> tuple[str, object]:
+def classify_host(host: str) -> tuple[str, str]:
     host = host.strip().lower().rstrip(".")
-    if not host or any(c.isspace() for c in host) or host.startswith("-"):
+    if not host or host.startswith("-") or any(c.isspace() for c in host):
         raise ValueError("A single IP or hostname is required")
     try:
         address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
         if address.version != 4:
-            raise ValueError("IPv6 is not supported in v1")
-        return "ip", address
-    except ValueError as err:
-        if "IPv6 is not supported" in str(err):
-            raise
-    if not HOST_RE.fullmatch(host) or "." not in host:
-        raise ValueError("Invalid hostname; use an FQDN, e.g. lab.example")
+            raise ValueError("IPv6 is not supported")
+        return "ip", str(address)
+    if not _is_fqdn(host):
+        raise ValueError("Invalid hostname; use an FQDN such as lab.example")
     return "domain", host
 
 
-def approved(scope_file: Path, target: str, kind: str):
+def _parse_url(target: str) -> tuple[str, str, int, str]:
+    if URL_BAD_RE.search(target):
+        raise ValueError("URL contains whitespace, control, glob or quote characters")
+    parts = urlsplit(target)
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"} or not parts.netloc or parts.username or parts.password:
+        raise ValueError("Only http:// or https:// URLs without embedded credentials are supported")
+    try:
+        port = parts.port
+    except ValueError as err:
+        raise ValueError("Invalid URL port") from err
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid URL port")
+    return scheme, parts.hostname or "", port or (443 if scheme == "https" else 80), parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+def evaluate(scope_file: Path, target: str, kind: str, resolver: Resolver = resolve_ipv4) -> Decision:
+    """Return the verified Decision, raise OutOfScope, or raise ValueError for bad input."""
     networks, domains = parse_allowed(scope_file)
     if not networks and not domains:
         raise ValueError("Scope is empty. Add your explicitly authorized IPs/CIDRs/domains to config/scope.txt")
-    if kind == "url":
-        parsed = urlsplit(target)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
-            raise ValueError("Only http:// or https:// URLs without embedded credentials are supported")
-        try:
-            if parsed.port is not None and not 1 <= parsed.port <= 65535:
-                raise ValueError("Invalid port")
-        except ValueError as err:
-            raise ValueError("Invalid URL port") from err
-        target = parsed.hostname or ""
-        kind = "host"
+
     if kind == "network":
-        try:
-            network = ipaddress.ip_network(target.strip(), strict=False)
-        except ValueError as err:
-            raise ValueError("Specify an IPv4 CIDR, such as 192.168.56.0/24") from err
-        if network.version != 4 or network.num_addresses > 256:
-            raise ValueError("Discovery in v1 is restricted to IPv4 networks no larger than /24")
-        return any(network.subnet_of(item) for item in networks)
-    if kind != "host":
+        net = _network(target.strip())
+        if net is None or net.version != 4:
+            raise ValueError("Specify an IPv4 CIDR, such as 192.168.56.0/24")
+        if net.num_addresses > MAX_ADDRESSES:
+            raise ValueError("Discovery is restricted to IPv4 networks no larger than /24")
+        if not any(net.subnet_of(item) for item in networks):
+            raise OutOfScope(f"{net} is not inside a listed network")
+        return Decision(host=str(net))
+
+    port = None
+    url = ""
+    if kind == "url":
+        scheme, host_part, port, path = _parse_url(target)
+        kind_host, host = classify_host(host_part)
+        netloc = host if port == (443 if scheme == "https" else 80) else f"{host}:{port}"
+        url = f"{scheme}://{netloc}{path or '/'}"
+    elif kind == "host":
+        kind_host, host = classify_host(target)
+    else:
         raise ValueError("Unknown target type")
-    type_, value = valid_host(target)
-    if type_ == "ip":
-        return any(value in item for item in networks)
-    return value in domains
+
+    if kind_host == "ip":
+        if not any(ipaddress.ip_address(host) in net for net in networks):
+            raise OutOfScope(f"{host} is not inside a listed network")
+        return Decision(host=host, addrs=(host,), port=port, url=url)
+
+    if host not in domains:
+        raise OutOfScope(f"{host} is not a listed domain")
+    addrs = resolver(host)
+    if not addrs:
+        raise ValueError(f"{host} resolved to no IPv4 address")
+    stray = [a for a in addrs if not any(ipaddress.ip_address(a) in net for net in networks)]
+    if stray:
+        raise OutOfScope(f"{host} resolves to address(es) outside scope: {', '.join(stray)}; list their IPs in scope.txt if authorized")
+    return Decision(host=host, addrs=tuple(addrs), port=port, url=url)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scope", type=Path)
-    parser.add_argument("kind", choices=["host", "network", "url"])
-    parser.add_argument("target")
-    args = parser.parse_args()
+def approved(scope_file: Path, target: str, kind: str, resolver: Resolver = resolve_ipv4) -> bool:
     try:
-        if approved(args.scope, args.target, args.kind):
-            print("IN SCOPE")
+        evaluate(scope_file, target, kind, resolver)
+        return True
+    except OutOfScope:
+        return False
+
+
+def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail: str, scope_file: Path) -> None:
+    try:
+        digest = hashlib.sha256(scope_file.read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - getuser can raise many things on odd systems
+        user = "unknown"
+    clean = lambda s: re.sub(r"[\x00-\x1f\x7f]", "?", s)[:300]  # noqa: E731
+    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), clean(user),
+                     clean(action), kind, clean(target), verdict, digest, clean(detail)])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(row + "\n")
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--audit", type=Path, help="append the decision to this audit log (fail closed)")
+    parser.add_argument("--action", default="check")
+    parser.add_argument("scope", type=Path)
+    parser.add_argument("kind", choices=["host", "network", "url", "validate"])
+    parser.add_argument("target", nargs="?", default="")
+    args = parser.parse_args(argv)
+
+    def log(verdict, detail=""):
+        if args.audit:
+            _audit(args.audit, args.action, args.kind, args.target, verdict, detail, args.scope)
+
+    try:
+        if args.kind == "validate":
+            networks, domains = parse_allowed(args.scope)
+            print(f"scope OK: {len(networks)} network(s), {len(domains)} domain(s)")
             return 0
-        print("OUT OF SCOPE: target does not match config/scope.txt", file=sys.stderr)
-        return 2
+        decision = evaluate(args.scope, args.target, args.kind)
+        log("ALLOW", f"host={decision.host} addrs={','.join(decision.addrs)}")
+    except OutOfScope as exc:
+        print(f"OUT OF SCOPE: {exc}", file=sys.stderr)
+        verdict, detail = "DENY", str(exc)
     except ValueError as exc:
         print(f"SCOPE ERROR: {exc}", file=sys.stderr)
+        verdict, detail = "ERROR", str(exc)
+    except OSError as exc:
+        print(f"SCOPE ERROR: cannot write audit log (failing closed): {exc}", file=sys.stderr)
         return 2
+    else:
+        print("IN SCOPE")
+        print(f"host={decision.host}")
+        if decision.addrs:
+            print(f"addr={decision.addrs[0]}")
+        if decision.port:
+            print(f"port={decision.port}")
+        if decision.url:
+            print(f"url={decision.url}")
+        return 0
+    try:
+        log(verdict, detail)
+    except OSError as exc:
+        print(f"warning: audit log not written: {exc}", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
