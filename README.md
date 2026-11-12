@@ -48,7 +48,7 @@ Scoped (automated) actions go through `scripts/scope_guard.py`, the same engine 
    2. *You type `YES`.* For a listed name this also authorizes one DNS lookup of that name.
    3. *Resolve and verify:* every IPv4 answer must lie inside a listed network, otherwise the run is denied. The tool then connects to the **verified IP** (`curl --resolve`, Nmap on the address), never to a fresh lookup.
    `dig` and `Resolve-DnsName` are informational: any answer outside the verified set is flagged as **DNS drift** and logged. An unlisted name is denied without being resolved.
-4. **URLs:** http/https only, no credentials, no curl globbing characters (`[]{}`), no whitespace or quotes; `curl --globoff --noproxy '*' --max-redirs 0`. Query values, fragments and long token-like path segments are **redacted** on screen and in every log; the tool itself still receives the real URL. Response headers saved in `results/` may contain cookies or tokens.
+4. **URLs:** http/https only, no credentials, no curl globbing characters (`[]{}`), no whitespace or quotes; `curl --globoff --noproxy '*' --max-redirs 0`. The **entire query string** (keyed or not: `?token=x`, `?SECRET`), the fragment, userinfo, path parameters (`;jsessionid=`) and long token-like path segments are **redacted** on screen and in every log; the tool itself still receives the real URL. Redaction is best-effort: a secret in an ordinary short path segment cannot be recognised, and raw tool output (e.g. a curl error) may echo a URL. Response headers saved in `results/` may contain cookies or tokens.
 5. **Fail closed:** every run writes its audit entry *before* the command starts. If `results/audit.log` cannot be written (full or read-only media, a directory or link in its place), the action is refused. Result and report files get unique names and are never overwritten.
 
 **Manual tools are different.** Wireshark, Burp Suite, Metasploit and TestDisk are interactive programs the deck cannot constrain. They are marked **[MANUAL]**, require typing `MANUAL` (not `YES`), print an explicit "outside the scope gate" banner, and are audited as `manual`/`LAUNCH`. Metasploit starts as `msfconsole -q` only: no resource scripts, no `-x`, no automation.
@@ -57,6 +57,18 @@ The scope file is an operator guardrail, **not** an authorization mechanism. Per
 
 ### What the logs are and are not
 `results/audit.log`, custody logs, hash manifests and reports are **plain text files**. They help you reconstruct what happened and detect accidental changes; they are **not tamper-proof**. Anyone with write access to the stick can edit or delete them, and the scope hash in each row only identifies which scope file version was in use. For integrity that matters, hash and store copies elsewhere (the manifest feature helps) or sign them with your own tooling.
+
+Nmap runs with `-n` (no reverse DNS) against the verified IP, so a scan produces no name-resolution traffic of its own. Everything that writes or creates something (notes, reports, triage, manifests, evidence copies, encrypted archives, the Windows SHA-256 report) writes its audit entry first and is refused if that fails.
+
+## Path safety
+- A symlink, junction or other reparse point **anywhere** in an input or output path, including ancestor folders (`alias\evidence` where `alias` is a link), is rejected. Nothing is resolved through links; paths are normalized lexically and every existing component is checked.
+- **Linux/macOS:** creation walks the path with `O_NOFOLLOW` and directory file descriptors, so a link swapped in while the operation runs is refused by the OS (no check-then-use race).
+- **Windows:** there is no equivalent primitive here, so each step is *validate chain, exclusive create, re-validate*. A link swapped in during the few milliseconds between validation and creation is detected afterwards and the file just created is removed, but data could briefly exist at the redirected location. Mitigation: do not run the deck on a stick or folder that another process can modify concurrently.
+- Paths that legitimately traverse a link (macOS `/var`, OneDrive placeholders, `subst` drives) are refused; resolve them yourself and pass the real path.
+- Outputs (manifests, reports, evidence copies, result files) are created exclusively and never overwritten.
+
+## Release checksums
+`SHA256SUMS.txt` lists every git-tracked file except itself (a test enforces exact coverage; regenerate with `bash scripts/make-sums.sh` as the last step before a commit). It shows your copy is consistent with the list; it is **not** an authenticity proof, because anyone who can change a file can regenerate the list. To check authenticity compare the commit hash against one obtained from the repository through a trusted channel.
 
 ## Evidence handling rules
 - Symlinks, junctions and other reparse points are **rejected** (never followed) by evidence acquisition, manifests, verification, reports and the USB installer.
@@ -78,7 +90,7 @@ Add a tool by writing a function and one `reg` (scoped) or `regm` (manual) line 
 
 ## Verification status
 
-Run `bash scripts/test-deck.sh` (or `python -B -I -m unittest discover -s tests`). No test can scan, touch a disk or reach the network: external programs are stubbed with tripwires, Python children run with fake DNS and blocked connects, and the Windows tests mock all disk queries. Python 3.8 compatibility is checked statically (`tests/test_py38_compat.py`). Repository hygiene (no secrets, results, ISOs, persistence files) is checked against what git would commit and against history.
+Run `bash scripts/test-deck.sh` (or `python -B -I -m unittest discover -s tests`). No test can scan, touch a disk or reach the network. The shell tests run with a **restricted PATH**: only stubs (every network, disk and host-inspection tool, including `uname`, `uptime`, `id`, `df`, `ls`) and a short allowlist of benign text utilities exist; anything else triggers `command_not_found_handle` and fails the test. Stub precedence is verified before each run. Python children run with fake DNS and blocked connects, in-process sockets are blocked, and the Windows tests mock all disk queries. The USB update is covered by fault injection at every step (staging, user-data copy, verification, each rename, each rollback step, real `Copy-Item`/`Rename-Item` failures) against disposable folders, asserting by SHA-256 that no evidence file disappears or changes. Python 3.8 compatibility is checked statically (`tests/test_py38_compat.py`). Repository hygiene (no secrets, results, ISOs, persistence files) is checked against what git would commit and against history.
 
 **Not verified (needs a human, Kali, or hardware):** booting from the USB, Ventoy, Kali Live on the ASUS laptop, persistence, real Nmap/tshark/Wireshark/Burp/Metasploit behavior, the raw-key UI in a real Kali terminal, `gpg` encryption, `shellcheck`, running on an actual Python 3.8 interpreter, and the tests that need real file symlinks (skipped where the privilege is missing).
 

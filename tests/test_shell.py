@@ -22,8 +22,13 @@ SUPPORT = ROOT / "tests" / "support"
 # Anything that could scan, connect, touch a disk, capture traffic or inspect the host.
 STUBBED = ["nmap", "curl", "dig", "openssl", "tshark", "wireshark", "burpsuite", "msfconsole", "smartctl", "testdisk",
            "lsblk", "gpg", "file", "wget", "nc", "ncat", "ssh", "telnet", "ftp", "ping", "traceroute", "tracert", "whois",
-           "ps", "ss", "ip", "who", "last", "getent", "crontab", "systemctl", "lsmod", "mount", "find", "timeout"]
+           "ps", "ss", "ip", "who", "last", "getent", "crontab", "systemctl", "lsmod", "mount", "find", "timeout",
+           "uname", "uptime", "id", "df", "ls", "hostname", "whoami", "dd", "fdisk", "parted", "mkfs", "wipefs"]
 SAFE_REAL_DEPS = {"python3", "tar"}  # registry dependencies that are allowed to run for real
+# The ONLY real programs a test may execute: pure text/file utilities working on the disposable temp dirs, the clock,
+# and the interpreter. Everything else resolves to nothing and trips command_not_found_handle (-> test failure).
+ALLOWED_REAL = ["python3", "python", "py", "date", "tee", "tar", "gzip", "grep", "sed", "tr", "tail", "head", "cat", "mkdir", "rm", "mv",
+                "cp", "chmod", "touch", "dirname", "basename", "sort", "uniq", "wc", "cut", "cygpath"]
 
 
 def find_bash():
@@ -75,13 +80,23 @@ class ShellCase(unittest.TestCase):
                    STUBDIR=self.stubs.as_posix(), PYTHONPATH=str(SUPPORT), ZD_FAKE_DNS=fake_dns,
                    ZD_DNSLOG=self.dnslog.as_posix(), PYTHONDONTWRITEBYTECODE="1")
         env.update(extra_env or {})
-        pre = 'STUBDIR="$(cygpath -u "$STUBDIR" 2>/dev/null || printf %s "$STUBDIR")"; export PATH="$STUBDIR:$PATH"\n'
+        env["SAFEBIN"] = (self.tmp / "safebin").as_posix()
+        # 1) build wrappers for the allowlisted real tools using the ORIGINAL PATH, 2) then RESTRICT PATH to stubs + wrappers only.
+        pre = 'STUBDIR="$(cygpath -u "$STUBDIR" 2>/dev/null || printf %s "$STUBDIR")"; SAFEBIN="$(cygpath -u "$SAFEBIN" 2>/dev/null || printf %s "$SAFEBIN")"\n'
+        pre += 'if [ ! -e "$SAFEBIN/.ready" ]; then mkdir -p "$SAFEBIN"\nfor _c in ' + " ".join(ALLOWED_REAL) + '; do _p="$(command -v "$_c" 2>/dev/null)"; '
+        pre += '[ -n "$_p" ] && { printf \'#!/bin/sh\\nexec "%s" "$@"\\n\' "$_p" > "$SAFEBIN/$_c"; chmod +x "$SAFEBIN/$_c"; }; done; : > "$SAFEBIN/.ready"; fi\n'
+        pre += 'export PATH="$STUBDIR:$SAFEBIN"\n'
+        pre += 'command_not_found_handle() { echo "UNEXPECTED_REAL_COMMAND:$1" >&2; echo "UNEXPECTED_REAL_COMMAND:$1"; return 127; }\n'
+        # 3) verify precedence BEFORE anything runs: every stub resolves to the stub, every allowed tool to its wrapper
         pre += "for _t in " + " ".join(STUBBED) + '; do [ "$(command -v "$_t")" = "$STUBDIR/$_t" ] || { echo "STUB_NOT_FIRST:$_t"; exit 99; }; done\n'
+        pre += "for _t in " + " ".join(ALLOWED_REAL) + '; do _r="$(command -v "$_t" 2>/dev/null)"; [ -z "$_r" ] || [ "$_r" = "$SAFEBIN/$_t" ] || { echo "ALLOWED_NOT_WRAPPED:$_t"; exit 99; }; done\n'
         pre += 'cd "$ZD_ROOT"; source lib/common.sh; source lib/ui.sh; for m in modules/*.sh; do source "$m"; done\n'
         # bytes in/out: text mode would send CRLF on Windows and corrupt `read` answers
         r = subprocess.run([BASH, "-c", pre + script], input=stdin.encode(), capture_output=True, env=env, timeout=180)
         out, err = (b.decode("utf-8", "replace").replace("\r\n", "\n") for b in (r.stdout, r.stderr))
         self.assertNotIn("STUB_NOT_FIRST", out, "a real tool could have shadowed its stub")
+        self.assertNotIn("ALLOWED_NOT_WRAPPED", out, "an allowlisted tool resolved outside the sandbox bin")
+        self.assertNotIn("UNEXPECTED_REAL_COMMAND", out + err, "the code under test tried to run a command that is neither stubbed nor allowlisted")
         return subprocess.CompletedProcess(r.args, r.returncode, out, err)
 
     def calls(self, name=None):
@@ -101,6 +116,13 @@ class ShellCase(unittest.TestCase):
     def verdicts(self):
         return [r[5] for r in self.audit_rows()]
 
+    def reset_results(self):
+        """Empty the disposable results folder between sub-scenarios."""
+        if self.results.exists():
+            shutil.rmtree(self.results)
+        if self.log.exists():
+            self.log.write_text("")
+
     def break_audit_log(self):
         """Make the audit log unusable (a directory), the way a full/readonly/hostile medium would."""
         self.results.mkdir(exist_ok=True)
@@ -113,7 +135,7 @@ class ShellCase(unittest.TestCase):
 class SyntaxTests(unittest.TestCase):
     @unittest.skipUnless(BASH, "bash not available")
     def test_all_scripts_parse(self):
-        scripts = [ROOT / "zero-deck.sh", ROOT / "setup-kali.sh", ROOT / "scripts" / "test-deck.sh",
+        scripts = [ROOT / "zero-deck.sh", ROOT / "setup-kali.sh", ROOT / "scripts" / "test-deck.sh", ROOT / "scripts" / "make-sums.sh",
                    *sorted((ROOT / "lib").glob("*.sh")), *sorted((ROOT / "modules").glob("*.sh"))]
         for s in scripts:
             r = subprocess.run([BASH, "-n", s.as_posix()], capture_output=True, text=True)
@@ -148,6 +170,26 @@ class IsolationTests(ShellCase):
         import socket
         with self.assertRaises(AssertionError):
             socket.getaddrinfo("example.com", 80)
+
+    def test_unlisted_real_command_fails_the_test(self):  # audit item 6: unexpected real execution must not pass silently
+        for cmd in ("perl -e 1", "nslookup example.invalid", "host example.invalid", "ruby -v", "python3_not_allowlisted"):
+            with self.assertRaises(AssertionError, msg=cmd):
+                self.sh(cmd)
+
+    def test_host_inspection_commands_are_stubs_that_return_nothing(self):
+        r = self.sh('uname -a; uptime; id; df -h; ls /; hostname; whoami; echo DONE')
+        self.assertEqual(r.stdout.strip(), "DONE", "a host-inspection command produced real output")
+        self.assertEqual({c[0] for c in self.calls()}, {"uname", "uptime", "id", "df", "ls", "hostname", "whoami"})
+
+    def test_local_actions_never_touch_the_host(self):
+        self.sh("local_inventory; triage_linux")
+        ran = {c[0] for c in self.calls()}
+        self.assertTrue(ran <= set(STUBBED), f"something other than a stub recorded activity: {ran - set(STUBBED)}")
+
+    def test_allowed_real_tools_are_wrapped_and_nothing_else_is_on_path(self):
+        r = self.sh('IFS=:; for d in $PATH; do echo "$d"; done')
+        dirs = [d for d in r.stdout.split() if d]
+        self.assertEqual(len(dirs), 2, dirs)  # stubs + wrappers; no system directory
 
     def test_tripwire_fires_if_a_stub_is_missing(self):
         # Remove one stub: the real curl (or nothing) would then be resolved, and the harness must refuse to run.
@@ -249,6 +291,36 @@ class GateTests(ShellCase):
         for flag in ("--host-timeout", "--top-ports", "--open"):
             self.assertIn(flag, args)
 
+    def test_nmap_exact_invocations_disable_reverse_dns(self):  # post-remediation audit finding: nmap without -n
+        self.sh("nmap_discovery", stdin="192.168.56.0/24\nYES\n")
+        self.sh("nmap_top_ports", stdin="192.168.56.5\nYES\n")
+        self.sh("nmap_custom_ports", stdin="192.168.56.5\nYES\n22,80\n")
+        discovery, top, custom = self.calls("nmap")
+        self.assertEqual(discovery, ["nmap", "-n", "-sn", "--host-timeout", "30s", "192.168.56.0/24"])
+        self.assertEqual(top, ["nmap", "-n", "-sT", "-sV", "--version-light", "--top-ports", "100", "--open",
+                               "--host-timeout", "5m", "--max-retries", "2", "192.168.56.5"])
+        self.assertEqual(custom, ["nmap", "-n", "-sT", "-sV", "--version-light", "-p", "22,80", "--open",
+                                  "--host-timeout", "5m", "--max-retries", "2", "192.168.56.5"])
+
+    def test_nmap_receives_only_the_pinned_ip_never_the_name(self):
+        self.scope.write_text("192.168.56.0/24\nlab.example\n")
+        for fn, extra in (("nmap_top_ports", ""), ("nmap_custom_ports", "443\n")):
+            self.sh(fn, stdin=f"lab.example\nYES\n{extra}", fake_dns="lab.example=192.168.56.10")
+        calls = self.calls("nmap")
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            self.assertIn("-n", args)
+            self.assertEqual(args[-1], "192.168.56.10")
+            self.assertFalse([a for a in args if "lab.example" in a], "the hostname must never be passed to nmap")
+        self.assertEqual(self.dns_lookups(), ["lookup lab.example", "lookup lab.example"])  # one guarded lookup per run, none by nmap's own args
+
+    def test_every_nmap_invocation_in_the_code_has_dash_n(self):  # static guard against a future un-hardened addition
+        import re
+        for f in (ROOT / "modules").glob("*.sh"):
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if re.search(r"\blogrun\b.*\bnmap\b", line):
+                    self.assertRegex(line, r"\bnmap -n\b", f"{f.name}: {line.strip()}")
+
     def test_discovery_rejects_broad_network(self):
         self.sh("nmap_discovery", stdin="192.168.0.0/16\nYES\n")
         self.assertEqual(self.calls("nmap"), [])
@@ -315,8 +387,18 @@ class GateTests(ShellCase):
         r = self.sh("http_headers", stdin=f"{url}\nYES\n")
         everything = r.stdout + r.stderr + "".join(p.read_text(errors="replace") for p in self.results.rglob("*") if p.is_file())
         self.assertNotIn("SECRETVALUE", everything)
-        self.assertIn("token=REDACTED&b=REDACTED", everything)  # `&` must survive bash 5.2 patsub_replacement
+        self.assertIn("https://192.168.56.5/reset?REDACTED", everything)  # the whole query is replaced, whatever its shape
         self.assertEqual(self.calls("curl")[0][-1], "https://192.168.56.5/reset?token=SECRETVALUE&b=SECRETVALUE")  # tool still gets the real URL
+
+    def test_keyless_and_odd_query_strings_are_fully_redacted(self):  # audit finding: ?SECRETVALUE leaked
+        for url in ("https://192.168.56.5/reset?SECRETVALUE", "https://192.168.56.5/p?a=1&SECRETVALUE&b", "https://192.168.56.5/p;jsessionid=SECRETVALUE",
+                    "https://192.168.56.5/p?x=SECRETVALUE#SECRETVALUE", "https://192.168.56.5/a/SECRETVALUESECRETVALUESECRETVALUE/b"):
+            with self.subTest(url=url):
+                self.reset_results()
+                r = self.sh("http_headers", stdin=f"{url}\nYES\n")
+                everything = r.stdout + r.stderr + "".join(p.read_text(errors="replace") for p in self.results.rglob("*") if p.is_file())
+                self.assertNotIn("SECRETVALUE", everything)
+                self.assertEqual(self.calls("curl")[-1][-1], url.partition("#")[0])  # the authorised request still uses the real URL
 
     def test_dns_uses_timeouts(self):
         self.sh("dns_lookup", stdin="192.168.56.5\nYES\n")
@@ -404,7 +486,7 @@ class ManualToolTests(ShellCase):  # audit item 5
 
 class UniqueOutputTests(ShellCase):  # audit item 9
     def test_same_second_runs_never_overwrite(self):
-        r = self.sh('stamp() { echo FIXED; }; for i in 1 2 3 4 5; do logrun dup echo "RUN_$i" >/dev/null; done; ls "$RESULTS" | grep -c "^FIXED_dup"')
+        r = self.sh('stamp() { echo FIXED; }; for i in 1 2 3 4 5; do logrun dup echo "RUN_$i" >/dev/null; done; n=0; for f in "$RESULTS"/FIXED_dup*; do n=$((n+1)); done; echo "$n"')
         self.assertEqual(r.stdout.strip().splitlines()[-1], "5")
         bodies = sorted(p.read_text().strip() for p in self.results.glob("FIXED_dup*"))
         self.assertEqual(bodies, [f"RUN_{i}" for i in range(1, 6)])
@@ -438,7 +520,7 @@ class UtilityTests(ShellCase):
         self.assertTrue((d / "MANIFEST.sha256").is_file())
         self.assertTrue((d / "system.txt").is_file())
         ran = {c[0] for c in self.calls()}
-        self.assertTrue({"ps", "ss", "ip"} <= ran, ran)  # proves the host-inspecting commands were the stubs
+        self.assertTrue({"ps", "ss", "ip", "uname", "uptime", "id"} <= ran, ran)  # proves host inspection hit stubs, not the host
         r = subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / "evidence.py"), "verify", str(d / "MANIFEST.sha256")],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout)
@@ -472,6 +554,36 @@ class UtilityTests(ShellCase):
         r = self.sh("make_report", stdin="Title\nOp\n")
         self.assertTrue(list(self.results.glob("report_*.md")), r.stdout + r.stderr)
         self.assertIn("ALLOW", self.sh("view_audit").stdout)
+
+    def test_note_creation_is_audited_before_the_file_exists(self):  # post-remediation audit finding
+        self.sh("new_note", stdin="my-note\n")
+        self.assertEqual(len(list(self.notes.glob("*-my-note.md"))), 1)
+        rows = self.audit_rows()
+        self.assertEqual((rows[-1][2], rows[-1][3], rows[-1][5]), ("new_note", "local", "RUN"))
+
+    def test_note_creation_refused_when_audit_unavailable(self):
+        self.break_audit_log()
+        self.sh("new_note", stdin="my-note\n")
+        self.assertEqual(list(self.notes.glob("*")) if self.notes.exists() else [], [], "a note was created without an audit entry")
+
+    def test_existing_note_is_never_overwritten(self):
+        self.sh("new_note", stdin="keep-me\n")
+        note = next(self.notes.glob("*-keep-me.md"))
+        note.write_text("MY WORK")
+        r = self.sh("new_note", stdin="keep-me\n")
+        self.assertEqual(note.read_text(), "MY WORK")
+        self.assertIn("Not created", r.stdout)
+
+    def test_linked_results_parent_makes_every_audit_refuse(self):
+        from linkutil import make_dir_link
+        real = self.tmp / "real_results"
+        real.mkdir()
+        link = self.tmp / "results_link"
+        if not make_dir_link(link, real):
+            self.skipTest("neither symlinks nor junctions can be created here")
+        r = self.sh("audit a b c d e; echo rc=$?", extra_env={"ZD_RESULTS": link.as_posix()})
+        self.assertIn("rc=1", r.stdout)
+        self.assertEqual(list(real.iterdir()), [], "an audit row was written through the linked results folder")
 
     def test_notes_reject_traversal(self):
         self.sh("new_note", stdin="../escape\n")

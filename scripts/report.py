@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evidence import sha256_file  # noqa: E402
-from pathsafe import is_link  # noqa: E402
+from pathsafe import assert_no_links_in_chain, create_new_file, is_link  # noqa: E402
 
 AUDIT_TAIL = 50
 
@@ -45,6 +45,7 @@ def collect(results: Path):
 
 
 def build_report(results: Path, scope: Path | None, title: str, operator: str) -> str:
+    results = assert_no_links_in_chain(results)  # ancestors too: `alias/results` where alias is a link is refused
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     scope_hash = hashlib.sha256(scope.read_bytes()).hexdigest()[:16] if scope and scope.is_file() and not is_link(scope) else "n/a"
     out = [f"# {_cell(title)}", "", f"- Generated: {now}", f"- Operator: {_cell(operator)}", f"- Scope file SHA-256 (first 16): `{scope_hash}`",
@@ -74,8 +75,8 @@ def _create_exclusive(out: Path, explicit: bool, text: str) -> Path:
     for n in range(1000):
         candidate = out if n == 0 else out.with_name(f"{out.stem}_{n}{out.suffix}")
         try:
-            with candidate.open("x", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
+            with create_new_file(candidate) as fh:  # exclusive create; every ancestor validated; no write-through
+                fh.write(text.encode("utf-8"))
             return candidate
         except FileExistsError:
             if explicit:

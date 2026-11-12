@@ -19,6 +19,15 @@ for _c in python3 python py; do
 done
 unset _c
 
+# results/ must not sit behind a link or junction (a linked parent would redirect every audit entry and result file).
+# Checked once with python (detects Windows junctions); audit() re-checks symlinks on every call without forking.
+RESULTS_SAFE=1
+if [ -n "$PY" ] && ! "$PY" "$ROOT/scripts/pathsafe.py" check "$RESULTS" >/dev/null 2>&1; then
+  RESULTS_SAFE=0
+  printf 'warning: the results path passes through a link/junction (%s); audit logging, and so every audited action, is refused.\n' "$RESULTS" >&2
+fi
+_chain_has_symlink() { local p="$1"; while [[ "$p" == */* ]]; do [ -L "$p" ] && return 0; p="${p%/*}"; done; return 1; }
+
 say() { printf '%s\n' "$*"; }
 pause() { [ -n "${ZD_NO_PAUSE:-}" ] || read -r -p $'\nPress Enter to continue... ' _ || true; }
 
@@ -57,8 +66,8 @@ regm() { ZD_REG+=("$1|[MANUAL] $2|$3|${4:-}"); }
 # audit <action> <kind> <target> <verdict> <detail>. Returns 1 when the entry cannot be written: callers MUST stop.
 audit() {
   local log="$RESULTS/audit.log"
-  if [ -L "$log" ] || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
-    printf 'AUDIT LOG UNUSABLE (%s is a link or not a regular file): refusing to continue.\n' "$log" >&2; return 1
+  if [ "$RESULTS_SAFE" != 1 ] || _chain_has_symlink "$log" || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
+    printf 'AUDIT LOG UNUSABLE (%s, or a folder above it, is a link/junction or not a regular file): refusing to continue.\n' "$log" >&2; return 1
   fi
   { printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-${USERNAME:-unknown}}" \
     "$1" "$2" "${3//[$'\t\r\n']/ }" "$4" "${5//[$'\t\r\n']/ }" >>"$log"; } 2>/dev/null ||

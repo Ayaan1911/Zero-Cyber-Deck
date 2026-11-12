@@ -30,11 +30,23 @@ function Test-LinkItem([string]$Path) {
     return [bool]($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
 }
 
+# True if the path or ANY existing ancestor folder is a link/junction/reparse point.
+function Test-ChainHasLink([string]$Path) {
+    $p = [System.IO.Path]::GetFullPath($Path)
+    while ($p) {
+        if ((Test-Path -LiteralPath $p) -and (Test-LinkItem $p)) { return $true }
+        $parent = Split-Path -Parent $p
+        if (-not $parent -or $parent -eq $p) { break }
+        $p = $parent
+    }
+    return $false
+}
+
 # Returns $true only if the entry was written. Callers MUST stop when it returns $false (fail closed).
 # The audit log is a plain text file: it records activity but does not prevent tampering.
 function Write-Audit([string]$Action, [string]$Kind, [string]$Target, [string]$Verdict, [string]$Detail) {
     try {
-        if (Test-LinkItem $AuditLog) { throw 'audit log is a link or junction' }
+        if (Test-ChainHasLink $AuditLog) { throw 'the audit log path (or a folder above it) is a link or junction' }
         $clean = { param($s) ($s -replace "[`t`r`n]", ' ') }
         $row = @((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $env:USERNAME, $Action, $Kind, (& $clean $Target), $Verdict, '-', (& $clean $Detail)) -join "`t"
         Add-Content -LiteralPath $AuditLog -Value $row -Encoding UTF8 -ErrorAction Stop
@@ -187,8 +199,10 @@ do {
         }
         '4' {
             $path = Read-Host 'Full path to local file'
-            if (Test-Path -LiteralPath $path -PathType Leaf) { Save-Report 'win_sha256' (Get-FileHash -LiteralPath $path -Algorithm SHA256 | Format-List | Out-String) }
-            else { Write-Host 'File not found.' }
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Host 'File not found.' }
+            elseif (Write-Audit 'win_sha256' 'local' $path 'RUN' 'sha256 of a local file; writes a report') {   # audited BEFORE the report is written
+                Save-Report 'win_sha256' (Get-FileHash -LiteralPath $path -Algorithm SHA256 | Format-List | Out-String)
+            }
         }
         '5' {
             $dir = Read-Host 'Folder path'

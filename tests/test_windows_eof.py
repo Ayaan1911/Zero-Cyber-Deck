@@ -3,12 +3,13 @@ import _isolation  # noqa: F401
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PS = shutil.which("powershell") or shutil.which("powershell.exe")
+PS = (shutil.which("powershell") or shutil.which("powershell.exe")) if sys.platform == "win32" else None
 
 
 @unittest.skipUnless(PS, "powershell.exe not available")

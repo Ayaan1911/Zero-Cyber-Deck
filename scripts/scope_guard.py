@@ -27,24 +27,34 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pathsafe import is_link  # noqa: E402
+from pathsafe import append_text, assert_no_links_in_chain  # noqa: E402
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
 URL_BAD_RE = re.compile(r"[^\x21-\x7e]|[\\\[\]{}<>^`|\"']")  # non-printable, whitespace, curl globs, quotes
 MAX_ADDRESSES = 256  # /24
 
-_QUERY_VALUE_RE = re.compile(r"([?&;][^=&;#\s]*=)[^&;#\s]*")
 _USERINFO_RE = re.compile(r"(//)[^/@\s]*@")
-_LONG_SEGMENT_RE = re.compile(r"(?<=/)[A-Za-z0-9_\-.~%]{24,}(?=/|\?|#|$)")
-_FRAGMENT_RE = re.compile(r"#.*$")
+_PATH_PARAM_RE = re.compile(r";[^/?#\s]*")
+_LONG_SEGMENT_RE = re.compile(r"(?<=/)[A-Za-z0-9_\-.~%]{24,}(?=/|$)")
 
 
 def redact(text: str) -> str:
-    """Best-effort removal of secrets from a URL-ish string before it reaches any log."""
-    text = _FRAGMENT_RE.sub("#REDACTED", text) if "#" in text else text
+    """Best-effort removal of secrets from a URL-ish string before it reaches any log or terminal summary.
+
+    * everything after the first '?' (the WHOLE query, keyed or not: `?token=x`, `?SECRET`, `?a&b`) and after '#'
+      is replaced, whatever its syntax
+    * userinfo (user:password@), path parameters (;jsessionid=...) and long token-like path segments are replaced
+    Best effort: a secret in an ordinary short path segment cannot be recognised."""
     text = _USERINFO_RE.sub(r"\1REDACTED@", text)
-    text = _QUERY_VALUE_RE.sub(r"\1REDACTED", text)
-    return _LONG_SEGMENT_RE.sub("REDACTED", text)
+    cut = min((i for i in (text.find("?"), text.find("#")) if i != -1), default=-1)
+    tail = ""
+    if cut != -1:
+        tail = text[cut] + "REDACTED"
+        text = text[:cut]
+    if "/" in text:  # path rules only for URL-shaped strings: a ';' in an ordinary message is not a path parameter
+        text = _PATH_PARAM_RE.sub(";REDACTED", text)
+        text = _LONG_SEGMENT_RE.sub("REDACTED", text)
+    return text + tail
 
 
 class OutOfScope(Exception):
@@ -200,8 +210,10 @@ def _clean(text: str) -> str:
 
 
 def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail: str, scope_file: Path) -> None:
-    if is_link(path):
-        raise OSError(f"audit log is a link/junction: {path}")
+    try:
+        assert_no_links_in_chain(path)  # the log AND every ancestor folder: a linked parent would redirect the write
+    except ValueError as exc:
+        raise OSError(str(exc)) from None
     try:
         digest = hashlib.sha256(scope_file.read_bytes()).hexdigest()[:16]
     except OSError:
@@ -210,12 +222,13 @@ def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail
         user = getpass.getuser()
     except Exception:  # noqa: BLE001 - getuser can raise many things on odd systems
         user = "unknown"
-    shown = redact(target) if kind == "url" else target
+    # redact EVERY kind: a mistyped host like "10.0.0.5?secret" must not reach the log either (hostnames/CIDRs are unaffected)
     row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), _clean(user),
-                     _clean(action), kind, _clean(shown), verdict, digest, _clean(redact(detail) if kind == "url" else detail)])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(row + "\n")
+                     _clean(action), kind, _clean(redact(target)), verdict, digest, _clean(redact(detail))])
+    try:
+        append_text(path, row + "\n")  # no-follow append; creates the folder safely if missing
+    except ValueError as exc:
+        raise OSError(str(exc)) from None
 
 
 def main(argv=None) -> int:

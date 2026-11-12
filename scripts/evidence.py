@@ -6,7 +6,8 @@
   evidence.py manifest DIR OUT          sha256sum-compatible; refuses to overwrite OUT; refuses links/junctions
   evidence.py verify MANIFEST [--allow-extra]   fails on changed, missing AND unlisted files
   evidence.py acquire SRC DESTDIR --case ID --examiner NAME   verified read-only copy + custody log
-Sources are only read. Links, junctions and reparse points are never followed: they are rejected.
+Sources are only read. A link, junction or reparse point ANYWHERE in an input or output path (including ancestor
+folders) is rejected, never followed. Outputs are created exclusively and never overwritten.
 The custody log and manifests are plain files: they document, but do not prevent, tampering.
 """
 from __future__ import annotations
@@ -21,7 +22,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pathsafe import is_link, reject_links_under  # noqa: E402
+from pathsafe import (  # noqa: E402
+    abs_path, append_text, assert_no_links_in_chain, create_new_file, is_link, make_dirs, reject_links_under,
+)
 
 CHUNK = 1024 * 1024
 HEX = set("0123456789abcdef")
@@ -62,20 +65,24 @@ def iter_files(root: Path, links: str = "error"):
 
 
 def write_manifest(directory: Path, out: Path) -> int:
-    if is_link(directory) or not directory.is_dir():
+    directory = assert_no_links_in_chain(directory)
+    if not directory.is_dir():
         raise ValueError(f"Not a plain directory: {directory}")
     if os.path.lexists(out):
         raise ValueError(f"Manifest already exists, not overwriting: {out}")
     lines = [f"{sha256_file(f)}  {f.relative_to(directory).as_posix()}" for f in iter_files(directory)]
-    with out.open("x", encoding="utf-8", newline="\n") as fh:  # exclusive create
-        fh.write("\n".join(lines) + ("\n" if lines else ""))
+    with create_new_file(out) as fh:  # exclusive create, ancestors validated, no write-through
+        fh.write(("\n".join(lines) + ("\n" if lines else "")).encode("utf-8"))
     return len(lines)
 
 
 def verify_manifest(manifest: Path):
     """Return (failed, missing, extra) relative paths. Entries are confined to the manifest directory and
     may not pass through links; anything on disk that the manifest does not list is reported as extra."""
-    base = manifest.parent.resolve()
+    manifest = assert_no_links_in_chain(manifest)
+    if is_link(manifest):
+        raise ValueError(f"Manifest is a link: {manifest}")
+    base = manifest.parent
     listed, failed, missing = set(), [], []
     for num, raw in enumerate(manifest.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not raw.strip():
@@ -83,7 +90,7 @@ def verify_manifest(manifest: Path):
         digest, sep, rel = raw.partition("  ")
         if not sep or len(digest) != 64 or set(digest.lower()) - HEX:
             raise ValueError(f"Malformed manifest line {num}")
-        target = (base / rel).resolve()
+        target = abs_path(base / rel)
         if base not in target.parents:
             raise ValueError(f"Manifest line {num} escapes the manifest directory: {rel!r}")
         reject_links_under(base, rel)
@@ -93,38 +100,34 @@ def verify_manifest(manifest: Path):
         elif sha256_file(target) != digest.lower():
             failed.append(rel)
     extra = [f.relative_to(base).as_posix() for f in iter_files(base, links="include")
-             if f.resolve() != manifest.resolve() and f.relative_to(base).as_posix() not in listed]
+             if f != manifest and f.relative_to(base).as_posix() not in listed]
     return failed, missing, extra
 
 
 def acquire(src: Path, dest_dir: Path, case: str, examiner: str) -> int:
     """Copy src (file or tree) into dest_dir, verifying hashes; append JSONL custody records.
-    Rejects links anywhere in the source and anywhere under the destination; never overwrites."""
+    Rejects links anywhere in the source path/tree and anywhere in the destination path; never overwrites."""
     if not os.path.lexists(src):
         raise ValueError(f"Source not found: {src}")
-    if is_link(src):
-        raise ValueError(f"Source is a link/junction, refusing: {src}")
-    if is_link(dest_dir):
-        raise ValueError(f"Destination is a link/junction, refusing: {dest_dir}")
-    src, dest_dir = src.resolve(), dest_dir.resolve()
+    src = assert_no_links_in_chain(src)          # includes ANCESTOR folders, not only the leaf
+    dest_dir = assert_no_links_in_chain(dest_dir)  # lexical absolute path; nothing is resolved through links
     if dest_dir == src or src in dest_dir.parents:
         raise ValueError("Destination must not be inside the source")
     files = [(src, Path(src.name))] if src.is_file() else [(f, Path(src.name) / f.relative_to(src)) for f in iter_files(src)]
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    make_dirs(dest_dir)
     log = dest_dir / "custody.jsonl"
     if is_link(log):
         raise ValueError(f"Custody log is a link, refusing: {log}")
     count = 0
     for file, rel in files:
-        reject_links_under(dest_dir, rel.parent)
         target = dest_dir / rel
         if os.path.lexists(target):
             raise ValueError(f"Refusing to overwrite existing evidence: {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        reject_links_under(dest_dir, rel.parent)
         digest = hashlib.sha256()
+        created = False
         try:
-            with file.open("rb") as reader, target.open("xb") as writer:  # exclusive create: no write-through
+            with file.open("rb") as reader, create_new_file(target) as writer:  # exclusive; every ancestor validated
+                created = True
                 for block in iter(lambda: reader.read(CHUNK), b""):
                     digest.update(block)
                     writer.write(block)
@@ -133,14 +136,13 @@ def acquire(src: Path, dest_dir: Path, case: str, examiner: str) -> int:
             if digest.hexdigest() != after:
                 raise ValueError(f"Hash mismatch copying {file}")
         except Exception:
-            if target.exists() and not is_link(target):
-                target.unlink()
+            if created and os.path.lexists(target) and not is_link(target):
+                target.unlink()  # only the partial copy WE just created
             raise
         target.chmod(0o444)
         record = {"time": _now(), "case": case, "examiner": examiner, "source": str(file), "copy": str(target),
                   "sha256": after, "size": target.stat().st_size, "action": "acquire"}
-        with log.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(record, sort_keys=True) + "\n")
+        append_text(log, json.dumps(record, sort_keys=True) + "\n")
         count += 1
     return count
 

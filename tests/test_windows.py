@@ -8,6 +8,7 @@ import _isolation  # noqa: F401  (blocks real DNS/network for this process)
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,7 @@ from linkutil import make_dir_link
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT = ROOT / "tests" / "support"
-PS = shutil.which("powershell") or shutil.which("powershell.exe")
+PS = (shutil.which("powershell") or shutil.which("powershell.exe")) if sys.platform == "win32" else None  # WSL interop would run the Windows binary on Linux paths
 SCRIPTS = [ROOT / "Start-ZeroDeck.ps1", ROOT / "Install-ZeroDeck.ps1"]
 INSTALL = ROOT / "Install-ZeroDeck.ps1"
 
@@ -201,7 +202,7 @@ class DeployTests(WindowsCase):
         (old / "mine.txt").write_text("PRECIOUS")
         (usb / "STAGE").mkdir()  # pre-existing staging path -> deployment must stop before touching anything
         r = self.deploy(src, old, extra=" -UpdateMode", staging="STAGE")
-        self.assertIn("ERR: Staging path already exists", r.stdout, r.stdout + r.stderr)
+        self.assertIn("ERR: Path already exists, not touching it", r.stdout, r.stdout + r.stderr)
         self.assertEqual((old / "mine.txt").read_text(), "PRECIOUS")
         self.assertEqual(sorted(p.name for p in usb.iterdir()), ["STAGE", "ZERO-Deck"])
 

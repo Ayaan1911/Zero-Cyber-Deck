@@ -8,7 +8,7 @@ Ventoy + Kali **Live** + SystemRescue (+ optional Hiren's BootCD PE, Clonezilla)
 
 ## 1. Prepare on Windows (all manual unless noted)
 
-1. **Verify this project**: from Git Bash run `sha256sum -c SHA256SUMS.txt` and the self-tests (`bash scripts/test-deck.sh`).
+1. **Verify this project**: from Git Bash run `sha256sum -c SHA256SUMS.txt` and the self-tests (`bash scripts/test-deck.sh`). `SHA256SUMS.txt` lists every git-tracked release file except itself; it proves your copy is *consistent* with the list, **not authentic**: anyone able to change a file can change the list too. For authenticity compare the commit hash with one you obtained from the repository over a channel you trust.
 2. **Back up the USB.** Identify it by *model, size and disk number* in Disk Management, not by drive letter.
 3. **Install Ventoy (manual, ERASES the USB).** Download from https://www.ventoy.net/en/download.html, verify its checksum, run `Ventoy2Disk.exe` as administrator, confirm the right disk, and install. Do not touch your internal disk. The big data partition (default label `Ventoy`, exFAT) holds ISOs and ZERO-Deck.
 4. **Download ISOs from the official sites only** and verify their SHA-256 against the publisher's value (use the deck: `python scripts\evidence.py verify-file <iso> <sha256>`):
@@ -22,7 +22,16 @@ Ventoy + Kali **Live** + SystemRescue (+ optional Hiren's BootCD PE, Clonezilla)
    .\Install-ZeroDeck.ps1 -DriveLetter E             # type COPY; staged, hash-verified, then swapped in
    .\Install-ZeroDeck.ps1 -DriveLetter E -Update     # replace an existing install; old copy is kept
    ```
-   How it protects you: files are first copied to `ZERO-Deck.staging-<time>` on the stick and every file is SHA-256 verified; only a fully verified stage is swapped in. With `-Update` the old install is renamed to `ZERO-Deck.bak-<time>` (never deleted; remove it yourself later) and your `results\`, `notes\` and `config\scope*.txt` are carried over; any failure rolls back to the old install. It refuses a destination or parent folder that is a link/junction, skips links found in the source, refuses non-USB disks and volumes not labelled like Ventoy (override with `-AllowNonVentoyLabel` if you renamed it), never copies `results\` contents, `.git`, logs or images, and never formats or installs anything. If you unplug the stick mid-copy, delete any leftover `ZERO-Deck.staging-*` folder. If script execution is blocked, copy the folder in File Explorer (skip `results\` and `.git`) instead; do not weaken the system execution policy.
+   **Data-preservation model.** The installer never deletes anything and never *moves* your data. The new version is copied into `ZERO-Deck.staging-<time>` and every file is SHA-256 verified. With `-Update`, your `results\`, `notes\` and `config\scope*.txt` are then **copied** (not moved) from the old install into the stage and verified again, while the old install is left untouched; the old install is re-checked right before the switch, and the update aborts if it changed. The switch is two directory renames (old -> `ZERO-Deck.bak-<time>`, stage -> `ZERO-Deck`), followed by a final verification. If anything fails, the renames are undone (a bad new tree is renamed to `ZERO-Deck.failed-<time>`, never removed). If even the undo fails, the script stops with exact manual-recovery instructions. Leftover `.staging-`, `.bak-` and `.failed-` folders are yours to inspect and delete.
+   It also refuses a destination or parent folder that is a link/junction, refuses an update when your results or notes contain a link/junction, skips links found in the source, refuses non-USB disks and volumes not labelled like Ventoy (override with `-AllowNonVentoyLabel` if you renamed it), never copies `results\` contents from the source, `.git`, logs or images, and never formats or installs anything. If script execution is blocked, copy the folder in File Explorer (skip `results\` and `.git`) instead; do not weaken the system execution policy.
+
+   **Recovering from an interrupted or failed update (manual).**
+   - Message `UPDATE ABORTED, NOTHING CHANGED`: your install was not touched. Inspect, then delete the named `.staging-` folder when you wish.
+   - Message `UPDATE ROLLED BACK`: your original install is back in place; the unverified new tree is at the named `.failed-` folder.
+   - Message `MANUAL RECOVERY REQUIRED`: **no data was deleted.** The message names where your original install is (normally `ZERO-Deck.bak-<time>`). Rename that folder back to `ZERO-Deck` (File Explorer: F2, or `Rename-Item`), after moving or renaming any other `ZERO-Deck` folder out of the way.
+   - Power loss, crash or unplugging **between the two renames** leaves `ZERO-Deck.bak-<time>` and no `ZERO-Deck`: rename the `.bak-` folder back to `ZERO-Deck`.
+
+   **Limits (Windows).** A sequence of folder renames is not an atomic transaction, and exFAT has no journal; the design above guarantees *no deletion and no move of your data*, not that nothing is ever left half-done. A file or folder open in another program (Explorer window, antivirus scan) can make a rename fail; the script then rolls back or asks for manual recovery. Reparse-point (link/junction) checks happen before use, and a link swapped in during the few milliseconds between a check and a write cannot be excluded on Windows (see "Path safety" in README); keep the stick unplugged from other machines while updating. Disk space for the stage plus your carried-over data is required (about 1.2x).
 
 Expected layout: see `USB-LAYOUT.txt`.
 
@@ -52,7 +61,7 @@ Ventoy persistence docs: https://www.ventoy.net/en/plugin_persistence.html ; Kal
 - **No reboot (Windows):** `powershell -NoProfile -File .\Start-ZeroDeck.ps1` for hashing, scope-gated DNS/traceroute, triage, reports.
 - **USB boot:** Ventoy -> Kali Live -> mount data partition -> `bash zero-deck.sh`.
 - **Heavy work:** use a Kali VM on the laptop SSD; keep the scripts on the stick.
-- Metasploit/Wireshark/Burp are only launched by you, after typing YES. The deck never runs exploits.
+- Wireshark, Burp, Metasploit and TestDisk are **[MANUAL]** items: you must type `MANUAL` (not `YES`) to launch them, they are audited as `manual`, and the scope gate cannot constrain what they do. Scoped actions (Nmap, DNS, HTTP headers, TLS) ask for `YES` after a no-DNS pre-check and then resolve and verify the target. The deck never runs exploits.
 
 ## 5. Troubleshooting
 
@@ -73,4 +82,5 @@ Ventoy persistence docs: https://www.ventoy.net/en/plugin_persistence.html ; Kal
 - [ ] Data partition mounts read-write; `bash zero-deck.sh --check` runs
 - [ ] Local inventory works; results written to `results/`
 - [ ] Scope-gated lab scan against your own lab VM works and an out-of-scope target is refused
+- [ ] `Install-ZeroDeck.ps1 -DryRun`, then a real install, then `-Update`: your own test file in `results\` is still there, byte-identical, and a `.bak-` folder exists
 - [ ] (optional) persistence survives a reboot

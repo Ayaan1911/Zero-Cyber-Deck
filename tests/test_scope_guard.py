@@ -274,26 +274,68 @@ class CliTests(Base):
         text = log.read_text()
         self.assertEqual(len(text.splitlines()), 4)
         self.assertNotIn("SECRETVALUE", text)
-        self.assertIn("token=REDACTED", text)
+        self.assertIn("reset?REDACTED", text)
+
+    def test_keyless_query_never_reaches_the_audit_log(self):  # post-remediation audit finding
+        log = Path(self.tmp.name) / "audit.log"
+        for u in ("https://192.168.56.5/reset?SECRETVALUE", "192.168.56.5/reset?SECRETVALUE", "https://8.8.8.8/x?SECRETVALUE",
+                  "https://192.168.56.5/p;jsessionid=SECRETVALUE", "10.0.0.5?SECRETVALUE"):
+            for kind in ("url", "host"):
+                self.run_guard("--audit", log, self.path, kind, "--", u)
+        text = log.read_text()
+        self.assertEqual(len(text.splitlines()), 10)
+        self.assertNotIn("SECRETVALUE", text)
+
+    def test_linked_audit_parent_is_refused(self):  # audit log written through an ancestor link
+        from linkutil import make_dir_link
+        real = Path(self.tmp.name) / "real_results"
+        real.mkdir()
+        link = Path(self.tmp.name) / "results_link"
+        if not make_dir_link(link, real):
+            self.skipTest("neither symlinks nor junctions can be created here")
+        r = self.run_guard("--audit", link / "audit.log", self.path, "host", "--", "192.168.56.5")
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("IN SCOPE", r.stdout)
+        self.assertEqual(list(real.iterdir()), [], "an audit entry was written through the link")
+        r = self.run_guard("--audit", link / "sub" / "audit.log", self.path, "host", "--", "192.168.56.5")
+        self.assertEqual(r.returncode, 2)
 
     def test_stdout_logurl_is_redacted_but_url_is_usable(self):
         r = self.run_guard(self.path, "url", "--", "https://192.168.56.5/p?token=SECRETVALUE")
         self.assertIn("url=https://192.168.56.5/p?token=SECRETVALUE", r.stdout)
-        self.assertIn("logurl=https://192.168.56.5/p?token=REDACTED", r.stdout)
+        self.assertIn("logurl=https://192.168.56.5/p?REDACTED", r.stdout)
+        self.assertNotIn("SECRETVALUE", [ln for ln in r.stdout.splitlines() if ln.startswith("logurl=")][0])
 
 
 class RedactTests(unittest.TestCase):
     def test_redact(self):
         cases = {
-            "https://h/p?token=abc&x=1": "https://h/p?token=REDACTED&x=REDACTED",
-            "https://h/p?a=1;b=2": "https://h/p?a=REDACTED;b=REDACTED",
+            "https://h/p?token=abc&x=1": "https://h/p?REDACTED",
+            "https://h/reset?SECRETVALUE": "https://h/reset?REDACTED",                  # keyless query (the audited leak)
+            "https://h/p?a=1&SECRETVALUE&b": "https://h/p?REDACTED",
+            "https://h/p?": "https://h/p?REDACTED",
+            "https://h/p?a=1;b=2": "https://h/p?REDACTED",
             "https://user:pw@h/p": "https://REDACTED@h/p",
             "https://h/p#access_token=zzz": "https://h/p#REDACTED",
+            "https://h/p?x=1#frag?more": "https://h/p?REDACTED",                         # everything after the first ? or #
+            "https://h/p#a?b=SECRETVALUE": "https://h/p#REDACTED",
+            "https://h/p;jsessionid=SECRETVALUE": "https://h/p;REDACTED",
+            "https://h/p;jsessionid=SECRETVALUE?x=1": "https://h/p;REDACTED?REDACTED",
             "https://h/api/v1/reset/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345/confirm": "https://h/api/v1/reset/REDACTED/confirm",
             "https://h/short/path": "https://h/short/path",
+            "192.168.56.5": "192.168.56.5",
+            "192.168.56.0/24": "192.168.56.0/24",
+            "lab.example": "lab.example",
+            "static check only; no DNS performed": "static check only; no DNS performed",   # ordinary messages are untouched
         }
         for raw, expected in cases.items():
             self.assertEqual(redact(raw), expected, raw)
+        for raw in cases:
+            self.assertNotIn("SECRETVALUE", redact(raw))
+
+    def test_redact_is_idempotent(self):
+        once = redact("https://u:p@h/x/ABCDEFGHIJKLMNOPQRSTUVWXYZ0123;k=v?a=SECRET#f")
+        self.assertEqual(redact(once), once)
 
     def test_out_of_scope_exception_is_distinct(self):
         self.assertTrue(issubclass(OutOfScope, Exception) and not issubclass(OutOfScope, ValueError))

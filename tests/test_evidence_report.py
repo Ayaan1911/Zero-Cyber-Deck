@@ -1,5 +1,6 @@
 import _isolation  # noqa: F401  (blocks real DNS/network for this process)
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ import report  # noqa: E402
 class TmpCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self._tmp.name)
+        self.dir = Path(self._tmp.name).resolve()  # a real path: the code under test rejects any link above its inputs
 
     def tearDown(self):
         for f in self.dir.rglob("*"):
@@ -281,6 +282,154 @@ class ReportTests(TmpCase):
             self.skipTest("file symlinks not permitted on this machine")
         text = report.build_report(res, None, "t", "o")
         self.assertNotIn(hashlib.sha256(b"TOPSECRET").hexdigest(), text)
+
+
+class AncestorLinkTests(TmpCase):
+    """A link in an ANCESTOR component (alias -> elsewhere) must never redirect reads or writes. Uses real symlinks on
+    Linux and junctions on Windows (make_dir_link picks whichever the platform allows)."""
+
+    def alias(self):
+        outside = self.outside()
+        alias = self.dir / "alias"
+        self.link_or_skip(alias, outside)
+        return alias, outside
+
+    def test_acquire_destination_behind_ancestor_link_is_refused(self):  # post-remediation audit finding
+        alias, outside = self.alias()
+        src = self.dir / "ev_src.txt"
+        src.write_text("evidence")
+        for dest in (alias / "ev", alias / "a" / "b" / "ev"):
+            with self.subTest(dest=dest.relative_to(self.dir).as_posix()):
+                with self.assertRaises(ValueError):
+                    evidence.acquire(src, dest, "C", "e")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["secret.txt"], "evidence was written through the ancestor link")
+
+    def test_acquire_source_behind_ancestor_link_is_refused(self):
+        alias, outside = self.alias()
+        (outside / "case").mkdir()
+        (outside / "case" / "x.txt").write_text("x")
+        with self.assertRaises(ValueError):
+            evidence.acquire(alias / "case", self.dir / "ev", "C", "e")
+        self.assertFalse((self.dir / "ev").exists() and list((self.dir / "ev").rglob("*.txt")))
+
+    def test_manifest_and_verify_behind_ancestor_link_are_refused(self):
+        alias, outside = self.alias()
+        (outside / "case").mkdir()
+        (outside / "case" / "x.txt").write_text("x")
+        with self.assertRaises(ValueError):
+            evidence.write_manifest(alias / "case", self.dir / "m.sha256")
+        evidence.write_manifest(outside / "case", outside / "case" / "M.sha256")  # legitimate path works
+        with self.assertRaises(ValueError):
+            evidence.verify_manifest(alias / "case" / "M.sha256")
+        with self.assertRaises(ValueError):
+            evidence.write_manifest(self.dir, alias / "M2.sha256")  # output behind a link
+        self.assertFalse((outside / "M2.sha256").exists())
+
+    def test_report_behind_ancestor_link_is_refused(self):
+        alias, outside = self.alias()
+        (outside / "r1").mkdir()
+        (outside / "r1" / "own.txt").write_text("o")
+        self.assertEqual(report.main(["--results", str(alias / "r1")]), 2)
+        self.assertEqual(list((outside / "r1").glob("report_*")), [])
+        real = self.dir / "res"
+        real.mkdir()
+        self.assertEqual(report.main(["--results", str(real), "--out", str(alias / "out.md")]), 2)
+        self.assertFalse((outside / "out.md").exists())
+
+    def test_cli_exit_codes_for_ancestor_links(self):
+        alias, outside = self.alias()
+        src = self.dir / "f.txt"
+        src.write_text("x")
+        self.assertEqual(evidence.main(["acquire", str(src), str(alias / "ev"), "--case", "c", "--examiner", "e"]), 2)
+
+    def test_chain_check_covers_every_ancestor_not_just_the_leaf(self):
+        alias, outside = self.alias()
+        (outside / "deep" / "er").mkdir(parents=True)
+        for p in (alias, alias / "deep", alias / "deep" / "er", alias / "deep" / "er" / "new.txt"):
+            with self.assertRaises(ValueError, msg=str(p)):
+                pathsafe.assert_no_links_in_chain(p)
+        self.assertEqual(pathsafe.assert_no_links_in_chain(outside / "deep"), outside / "deep")
+
+    def test_lexical_dotdot_cannot_hide_a_link(self):
+        alias, outside = self.alias()
+        sneaky = alias / ".." / "alias" / "ev"  # normalises to <tmp>/alias/ev, which must still be refused
+        with self.assertRaises(ValueError):
+            pathsafe.assert_no_links_in_chain(sneaky)
+
+
+class ReplacementRaceTests(TmpCase):
+    """Simulate a link swapped in between validation and creation (pathsafe._after_check_hook). Nothing may land in the
+    redirect target: POSIX refuses at open() (O_NOFOLLOW + dir fds); Windows detects afterwards and removes our file."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, pathsafe, "_after_check_hook", None)
+
+    def swap_in_link(self, victim, outside):
+        calls = []
+
+        def hook():
+            if calls:
+                return
+            calls.append(1)
+            os.rmdir(victim)
+            if not make_dir_link(victim, outside):
+                raise unittest.SkipTest("neither symlinks nor junctions can be created here")
+        pathsafe._after_check_hook = hook
+
+    def test_directory_swapped_for_a_link_before_file_creation(self):
+        outside = self.outside()
+        dest = self.dir / "ev"
+        dest.mkdir()
+        self.swap_in_link(dest, outside)
+        with self.assertRaises((ValueError, OSError)):
+            with pathsafe.create_new_file(dest / "evidence.bin") as fh:
+                fh.write(b"DATA")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["secret.txt"], "data landed in the redirect target")
+        self.assertEqual((outside / "secret.txt").read_text(), "TOPSECRET")
+
+    def test_race_during_acquire_leaves_no_evidence_outside(self):
+        outside = self.outside()
+        src = self.dir / "f.txt"
+        src.write_text("evidence")
+        dest = self.dir / "ev"
+        dest.mkdir()
+        self.swap_in_link(dest, outside)
+        with self.assertRaises((ValueError, OSError)):
+            evidence.acquire(src, dest, "C", "e")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["secret.txt"])
+
+    def test_audit_append_race_does_not_write_through(self):
+        outside = self.outside()
+        results = self.dir / "results"
+        results.mkdir()
+        self.swap_in_link(results, outside)
+        with self.assertRaises((ValueError, OSError)):
+            pathsafe.append_text(results / "audit.log", "row\n")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["secret.txt"], "an audit file or row appeared in the redirect target")
+
+    def test_existing_foreign_log_is_never_modified_by_a_detected_race(self):
+        outside = self.outside()
+        (outside / "audit.log").write_text("FOREIGN")
+        results = self.dir / "results"
+        results.mkdir()
+        self.swap_in_link(results, outside)
+        with self.assertRaises((ValueError, OSError)):
+            pathsafe.append_text(results / "audit.log", "row\n")
+        self.assertEqual((outside / "audit.log").read_text(), "FOREIGN")  # not appended to, not deleted
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX no-follow walk is only exercised on Linux/macOS")
+class PosixNoFollowTests(TmpCase):
+    def test_o_nofollow_walk_is_active(self):
+        self.assertTrue(pathsafe._POSIX_WALK)
+
+    def test_file_symlink_leaf_is_refused_even_if_target_is_missing(self):
+        link = self.dir / "dangling"
+        os.symlink(str(self.dir / "nowhere"), str(link))
+        with self.assertRaises((ValueError, OSError, FileExistsError)):
+            pathsafe.create_new_file(link)
+        self.assertFalse((self.dir / "nowhere").exists())
 
 
 class PathSafeTests(TmpCase):

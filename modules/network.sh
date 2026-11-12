@@ -16,14 +16,14 @@ local_inventory() {
 
 nmap_discovery() {
   prompt_target 'Enter AUTHORIZED IPv4 CIDR (max /24)' && gate network "$TARGET" nmap_discovery || return 0
-  logrun host_discovery nmap -sn --host-timeout 30s "$G_HOST"
+  logrun host_discovery nmap -n -sn --host-timeout 30s "$G_HOST"
 }
 
 nmap_top_ports() {
   prompt_target 'Enter AUTHORIZED single IP or hostname' && gate host "$TARGET" nmap_top_ports || return 0
   say "Scanning the verified address $G_ADDR (not a fresh DNS lookup)."
   [ "$G_ADDR" = "$G_ADDRS" ] || say "Note: $G_HOST has several verified addresses ($G_ADDRS); only the first is scanned. Re-run per address if needed."
-  logrun service_inventory nmap -sT -sV --version-light --top-ports 100 --open --host-timeout 5m --max-retries 2 "$G_ADDR"
+  logrun service_inventory nmap -n -sT -sV --version-light --top-ports 100 --open --host-timeout 5m --max-retries 2 "$G_ADDR"
 }
 
 # valid_ports: 1-65535, single, ranges, comma lists; nothing else reaches nmap
@@ -42,7 +42,7 @@ nmap_custom_ports() {
   prompt_target 'Enter AUTHORIZED single IP or hostname' && gate host "$TARGET" nmap_custom_ports || return 0
   read -r -p 'Ports (e.g. 22,80,443 or 1-1024): ' ports
   valid_ports "$ports" || { say 'Invalid port list. Use numbers 1-65535, ranges and commas only.'; return 0; }
-  logrun custom_ports nmap -sT -sV --version-light -p "$ports" --open --host-timeout 5m --max-retries 2 "$G_ADDR"
+  logrun custom_ports nmap -n -sT -sV --version-light -p "$ports" --open --host-timeout 5m --max-retries 2 "$G_ADDR"
 }
 
 wireshark_launch() {

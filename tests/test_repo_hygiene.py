@@ -70,6 +70,26 @@ class HygieneTests(unittest.TestCase):
         hits = [pat.pattern[:30] for pat in SECRET_PATTERNS if pat.search(added)]
         self.assertEqual(hits, [])
 
+    def test_release_manifest_covers_exactly_the_tracked_files_and_matches(self):  # post-remediation audit finding (LICENSE was missing)
+        import hashlib
+        tracked = {p.as_posix() for p in self.files} - {"SHA256SUMS.txt"}
+        listed = {}
+        for line in (ROOT / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+            m = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line)
+            self.assertIsNotNone(m, f"malformed manifest line: {line!r}")
+            self.assertNotIn(m.group(2), listed, f"duplicate entry {m.group(2)}")
+            listed[m.group(2)] = m.group(1)
+        self.assertEqual(sorted(tracked - set(listed)), [], "tracked files missing from SHA256SUMS.txt")
+        self.assertEqual(sorted(set(listed) - tracked), [], "SHA256SUMS.txt lists files that are not tracked")
+        self.assertNotIn("SHA256SUMS.txt", listed, "a file cannot contain its own hash")
+        stale = [name for name, digest in listed.items() if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest]
+        self.assertEqual(stale, [], "SHA256SUMS.txt is stale: regenerate it after the final change")
+
+    def test_working_tree_text_files_are_lf_so_checksums_match_on_every_platform(self):
+        out = git("ls-files", "--eol").stdout.splitlines()
+        crlf = [line for line in out if "w/crlf" in line or "w/mixed" in line]
+        self.assertEqual(crlf, [], "normalize line endings (.gitattributes forces eol=lf)")
+
     def test_default_scope_file_is_an_empty_template(self):
         active = [ln for ln in (ROOT / "config" / "scope.txt").read_text(encoding="utf-8").splitlines() if ln.split("#")[0].strip()]
         self.assertEqual(active, [], "config/scope.txt must stay an empty template; real targets go in config/scope.local.txt")
@@ -100,6 +120,22 @@ class DocsTests(unittest.TestCase):  # audit item 13
         self.assertEqual(missing, [])
         for needle in ("3.8", "PowerShell", "setup-kali.sh"):
             self.assertIn(needle, text)
+
+    def test_docs_describe_manual_tools_as_requiring_manual_not_yes(self):  # post-remediation audit finding (SETUP.md said YES)
+        for name in ("SETUP.md", "README.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if re.search(r"Metasploit|Wireshark|Burp|TestDisk", line) and re.search(r"(only launched by you|launch\w*|start\w*).{0,60}\bYES\b", line):
+                    self.fail(f"{name} says a manual tool needs YES: {line.strip()}")
+            self.assertIn("MANUAL", text)
+        setup = (ROOT / "SETUP.md").read_text(encoding="utf-8")
+        for needle in ("type `MANUAL`", "NOTHING CHANGED", "MANUAL RECOVERY REQUIRED", "not an atomic", "consistent"):
+            self.assertIn(needle, setup, f"SETUP.md should document: {needle}")
+
+    def test_readme_documents_path_safety_limits_and_log_limits(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for needle in ("Path safety", "O_NOFOLLOW", "not tamper-proof", "not** an authenticity proof", "-n"):
+            self.assertIn(needle, readme, f"README should document: {needle}")
 
     def test_readme_links_dependency_doc_and_states_python_floor(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
