@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Forensics: hashing, manifests, verified evidence copies, pcap summaries. Sources are only read.
-# Links/junctions are refused, existing manifests/evidence are never overwritten.
+# Links/junctions anywhere in a path are refused (every folder is opened once and held: scripts/safefs.py); existing manifests/evidence are never overwritten.
 
 EV="$ROOT/scripts/evidence.py"
 
@@ -34,7 +34,7 @@ evidence_acquire() {
   local src dest case examiner
   read -r -e -p 'Evidence source (file or folder, read-only): ' src
   [ -e "$src" ] || { say 'Source not found.'; return 0; }
-  read -r -e -p "Destination folder [$RESULTS/evidence]: " dest; dest="${dest:-$RESULTS/evidence}"
+  read -r -e -p "Destination folder [$EVIDENCE]: " dest; dest="${dest:-$EVIDENCE}"
   read -r -p 'Case ID: ' case; read -r -p 'Examiner name: ' examiner
   [ -n "$case" ] && [ -n "$examiner" ] || { say 'Case ID and examiner are required.'; return 0; }
   audit evidence_acquire local "$src" RUN "case=$case" || return 0

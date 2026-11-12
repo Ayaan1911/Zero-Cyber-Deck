@@ -90,6 +90,18 @@ class HygieneTests(unittest.TestCase):
         crlf = [line for line in out if "w/crlf" in line or "w/mixed" in line]
         self.assertEqual(crlf, [], "normalize line endings (.gitattributes forces eol=lf)")
 
+    def test_no_control_characters_in_tracked_text_files(self):
+        # a scripted edit once turned "\\report" into a carriage return and "\\auditlog" into a BEL inside a path literal
+        bad = []
+        for p in self.files:
+            if p.suffix.lower() in {".sh", ".py", ".ps1", ".md", ".txt", ".json"} or p.name in {"DATA_FORMAT", ".gitignore", ".gitattributes", "LICENSE"}:
+                data = (ROOT / p).read_bytes()
+                if any(b < 32 and b not in (9, 10, 13) for b in data):
+                    bad.append(p.as_posix())
+                if p.suffix == ".sh" and b"\r" in data:
+                    bad.append(p.as_posix() + " (CR in shell script)")
+        self.assertEqual(bad, [])
+
     def test_default_scope_file_is_an_empty_template(self):
         active = [ln for ln in (ROOT / "config" / "scope.txt").read_text(encoding="utf-8").splitlines() if ln.split("#")[0].strip()]
         self.assertEqual(active, [], "config/scope.txt must stay an empty template; real targets go in config/scope.local.txt")
@@ -97,7 +109,7 @@ class HygieneTests(unittest.TestCase):
     def test_gitignore_covers_sensitive_paths_and_keeps_placeholders(self):
         ignored = ["results/x.txt", "results/audit.log", "results/triage_1/system.txt", "config/scope.local.txt", "notes/n.md",
                    "kali.iso", "persistence/kali.dat", "a.img", "cap.pcapng", ".env", ".env.local", "k.pem", "id_rsa", "id_ed25519",
-                   "case_1/x.txt", "evidence/x", "custody.jsonl", "MANIFEST.sha256", "ZERO-Deck.bak-20260101/x", "ZERO-Deck.staging-1/x",
+                   "case_1/x.txt", "evidence/x", "custody.jsonl", "MANIFEST.sha256", "ZERO-Deck.bak-20260101/x", "ZERO-Deck.staging-1/x", "ZERO-Deck.failed-1/x", "ZERO-DATA/results/audit.log", "ZERO-DATA/.zerodeck-data",
                    ".venv/lib/x.py", "results_20260101T000000Z.tar.gz.gpg", "scripts/__pycache__/m.pyc", "ISO/kali.iso", "ventoy/ventoy.json"]
         kept = ["results/README.md", "notes/README.md", "config/scope.txt", "config/ventoy.persistence.EXAMPLE.json"]
         not_ignored = [p for p in ignored if git("check-ignore", "-q", "--no-index", p).returncode != 0]
@@ -136,6 +148,16 @@ class DocsTests(unittest.TestCase):  # audit item 13
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for needle in ("Path safety", "O_NOFOLLOW", "not tamper-proof", "not** an authenticity proof", "-n"):
             self.assertIn(needle, readme, f"README should document: {needle}")
+
+    def test_docs_describe_the_code_data_separation_and_its_limits(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        setup = (ROOT / "SETUP.md").read_text(encoding="utf-8")
+        for needle in ("ZERO-DATA", "--init-data", "migrate_data.py", "verify_release.py", "never created implicitly", "Raw tool output is sensitive",
+                       "not tested on real exFAT", "FILE_SHARE_DELETE", "O_NOFOLLOW"):
+            self.assertIn(needle, readme, f"README should document: {needle}")
+        for needle in ("ZERO-DATA", "Back up", "migrate_data.py --from", "-AcknowledgeLegacyData", "never touches"):
+            self.assertIn(needle, setup, f"SETUP.md should document: {needle}")
+        self.assertNotIn("carried over", setup.split("## 2.")[0].replace("never carried", ""), "the updater no longer carries user data over")
 
     def test_readme_links_dependency_doc_and_states_python_floor(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

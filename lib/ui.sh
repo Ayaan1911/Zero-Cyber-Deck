@@ -90,6 +90,11 @@ ui_category() {
 ui_main() {
   local i c cat label func deps ready total
   local -a labels=()
+  if [ "$DATA_READY" != 1 ]; then
+    say "${C_BAD}Data folder not ready:${C_RST} $DATA_MSG"
+    say "Anything that writes (audit log, results, notes, evidence) is refused until you run:  bash zero-deck.sh --init-data"
+  fi
+  legacy_data_present && say "${C_BAD}Old-layout data found inside the application folder${C_RST} (not used). See Utilities > Data folder status for the copy command."
   while :; do
     labels=()
     for c in "${ZD_CATS[@]}"; do

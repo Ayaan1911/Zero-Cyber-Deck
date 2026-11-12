@@ -16,16 +16,19 @@ PS = (shutil.which("powershell") or shutil.which("powershell.exe")) if sys.platf
 class EofTests(unittest.TestCase):
     def test_menu_exits_on_closed_or_garbage_input(self):
         with tempfile.TemporaryDirectory() as tmp:
-            deck = Path(tmp) / "deck"
+            deck = Path(tmp).resolve() / "ZERO-Deck"
             shutil.copytree(ROOT / "scripts", deck / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
             (deck / "config").mkdir()
             (deck / "config" / "scope.txt").write_text("192.168.56.0/24\n")
             shutil.copy(ROOT / "Start-ZeroDeck.ps1", deck)
+            shutil.copy(ROOT / "DATA_FORMAT", deck)
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            env.pop("ZD_DATA", None)
             for answers in ("", "x\n", "x\n\nx\n\nx\n"):
                 r = subprocess.run([PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(deck / "Start-ZeroDeck.ps1")],
-                                   input=answers, capture_output=True, text=True, timeout=60,
-                                   env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                                   input=answers, capture_output=True, text=True, timeout=60, env=env)
                 self.assertEqual(r.returncode, 0, (answers, r.stderr))
+            self.assertFalse((Path(tmp).resolve() / "ZERO-DATA").exists(), "the menu must not create the data folder by itself")
 
 
 if __name__ == "__main__":

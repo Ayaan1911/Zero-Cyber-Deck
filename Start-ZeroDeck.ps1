@@ -2,17 +2,22 @@
 # Nothing runs automatically. Network actions use the same Python scope gate as the Kali dashboard.
 #   powershell -NoProfile -File .\Start-ZeroDeck.ps1          interactive menu
 #   powershell -NoProfile -File .\Start-ZeroDeck.ps1 -Check   non-interactive dependency check (exit 1 on any problem)
-param([switch]$Check)
+param([switch]$Check, [switch]$InitData)
 $ErrorActionPreference = 'Continue'
 $Root = $PSScriptRoot
-$LocalScope = Join-Path $Root 'config\scope.local.txt'   # untracked file wins: real targets stay out of git
-$Scope = if (Test-Path -LiteralPath $LocalScope) { $LocalScope } else { Join-Path $Root 'config\scope.txt' }
-$Results = Join-Path $Root 'results'
+# The application folder ($Root) holds code only and is never written. Results, notes, evidence, your scope file and the
+# audit log live in the separate data folder (default: sibling ZERO-DATA, or $env:ZD_DATA). It is never created implicitly.
+$Data = if ($env:ZD_DATA) { $env:ZD_DATA } else { Join-Path (Split-Path $Root -Parent) 'ZERO-DATA' }
+$Results = Join-Path $Data 'results'
+$LocalScope = Join-Path $Data 'config\scope.local.txt'   # operator-owned, outside the application folder
+$Scope = if (Test-Path -LiteralPath $LocalScope) { $LocalScope } else { Join-Path $Root 'config\scope.txt' }   # template = empty = everything denied
 $Guard = Join-Path $Root 'scripts\scope_guard.py'
 $Evidence = Join-Path $Root 'scripts\evidence.py'
 $ReportPy = Join-Path $Root 'scripts\report.py'
+$AuditPy = Join-Path $Root 'scripts\auditlog.py'
+$DataPy = Join-Path $Root 'scripts\datadir.py'
 $AuditLog = Join-Path $Results 'audit.log'
-New-Item -ItemType Directory -Force -Path $Results | Out-Null
+$env:PYTHONDONTWRITEBYTECODE = '1'   # never write __pycache__ into the application folder (it must match SHA256SUMS.txt)
 
 function Find-Python {
     foreach ($name in 'python', 'python3', 'py') {
@@ -25,36 +30,34 @@ function Find-Python {
 }
 $Py = Find-Python
 
+# DataReady only if the data folder exists, carries the ZERO marker and is compatible with this application.
+$DataReady = $false
+$DataMessage = 'Python 3.8+ is required'
+if ($Py) {
+    $DataMessage = (& $Py $DataPy check --data $Data --app $Root 2>&1 | Out-String).Trim()
+    $DataReady = ($LASTEXITCODE -eq 0)
+}
+if ($InitData) {
+    if (-not $Py) { Write-Host 'Python 3.8+ is required.'; exit 1 }
+    & $Py $DataPy init --data $Data --app $Root
+    exit $LASTEXITCODE
+}
+
 function Test-LinkItem([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     return [bool]($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
 }
 
-# True if the path or ANY existing ancestor folder is a link/junction/reparse point.
-function Test-ChainHasLink([string]$Path) {
-    $p = [System.IO.Path]::GetFullPath($Path)
-    while ($p) {
-        if ((Test-Path -LiteralPath $p) -and (Test-LinkItem $p)) { return $true }
-        $parent = Split-Path -Parent $p
-        if (-not $parent -or $parent -eq $p) { break }
-        $p = $parent
-    }
-    return $false
-}
-
 # Returns $true only if the entry was written. Callers MUST stop when it returns $false (fail closed).
-# The audit log is a plain text file: it records activity but does not prevent tampering.
+# Written by scripts\auditlog.py through held directory handles (the whole path is walked without following links, no
+# check-then-write by name). The audit log is a plain text file: it records activity but does not prevent tampering.
 function Write-Audit([string]$Action, [string]$Kind, [string]$Target, [string]$Verdict, [string]$Detail) {
-    try {
-        if (Test-ChainHasLink $AuditLog) { throw 'the audit log path (or a folder above it) is a link or junction' }
-        $clean = { param($s) ($s -replace "[`t`r`n]", ' ') }
-        $row = @((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $env:USERNAME, $Action, $Kind, (& $clean $Target), $Verdict, '-', (& $clean $Detail)) -join "`t"
-        Add-Content -LiteralPath $AuditLog -Value $row -Encoding UTF8 -ErrorAction Stop
-        return $true
-    } catch {
-        Write-Host "AUDIT WRITE FAILED ($AuditLog): refusing to continue. $_" -ForegroundColor Red
-        return $false
-    }
+    if (-not $script:DataReady) { Write-Host "AUDIT UNAVAILABLE: $script:DataMessage" -ForegroundColor Red; return $false }
+    if (-not $Py) { Write-Host 'AUDIT UNAVAILABLE: Python 3.8+ is required.' -ForegroundColor Red; return $false }
+    $q = { param($s) ([string]$s) -replace '"', "'" }   # a double quote would split the native argument list
+    & $Py $AuditPy append --results $Results "--action=$(& $q $Action)" "--kind=$(& $q $Kind)" "--target=$(& $q $Target)" "--verdict=$(& $q $Verdict)" "--detail=$(& $q $Detail)" --scope $Scope | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "AUDIT WRITE FAILED ($Results): refusing to continue." -ForegroundColor Red; return $false }
+    return $true
 }
 
 # Unique, never-overwritten outputs.
@@ -144,6 +147,7 @@ function Test-Deck {
         $validation = (& $Py $Guard $Scope 'validate' 2>&1 | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) { $bad++; $report += "[invalid] scope file $Scope : $validation" } else { $report += "[ok]      $validation" }
     }
+    if ($DataReady) { $report += "[ok]      data folder: $DataMessage" } else { $report += "[problem] data folder not ready: $DataMessage  -> run: .\Start-ZeroDeck.ps1 -InitData"; $bad++ }
     $report | Out-Host
     return $bad
 }
@@ -154,6 +158,7 @@ if ($Check) {
 }
 
 $invalid = 0
+if (-not $DataReady) { Write-Host "Data folder not ready: $DataMessage" -ForegroundColor Red; Write-Host 'Anything that writes (audit log, results, evidence) is refused until you run:  .\Start-ZeroDeck.ps1 -InitData' -ForegroundColor Red }
 do {
     Write-Host "`n===========================================" -ForegroundColor Cyan
     Write-Host '       ZERO CYBERSEC DECK - WINDOWS'

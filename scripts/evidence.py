@@ -6,9 +6,14 @@
   evidence.py manifest DIR OUT          sha256sum-compatible; refuses to overwrite OUT; refuses links/junctions
   evidence.py verify MANIFEST [--allow-extra]   fails on changed, missing AND unlisted files
   evidence.py acquire SRC DESTDIR --case ID --examiner NAME   verified read-only copy + custody log
-Sources are only read. A link, junction or reparse point ANYWHERE in an input or output path (including ancestor
-folders) is rejected, never followed. Outputs are created exclusively and never overwritten.
-The custody log and manifests are plain files: they document, but do not prevent, tampering.
+
+SAFETY MODEL (see scripts/safefs.py): every source and destination directory is opened ONCE by walking its whole path
+without following links, and held open; every later operation (list, read, create, append) is relative to those held
+directories. Nothing is validated by name and then re-opened by name, so a link/junction/rename introduced after
+validation cannot redirect a read or a write. New evidence files are created exclusively, verified by re-reading through
+the same open file, and never replace an existing name. Cleanup of a failed copy removes only the object we created.
+Where the platform/volume cannot provide this (UNC/remote paths, non-canonical paths, macOS) the command REFUSES.
+Manifests, custody logs and reports are plain files: they document, but do not prevent, tampering.
 """
 from __future__ import annotations
 
@@ -16,135 +21,175 @@ import argparse
 import datetime
 import hashlib
 import json
-import os
-import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pathsafe import (  # noqa: E402
-    abs_path, append_text, assert_no_links_in_chain, create_new_file, is_link, make_dirs, reject_links_under,
-)
+import safefs  # noqa: E402
+from safefs import abs_path, sha256_file  # noqa: E402,F401  (sha256_file re-exported for callers/tests)
 
-CHUNK = 1024 * 1024
 HEX = set("0123456789abcdef")
 
+# Test seam (None in production): called as _race_hook(stage, **context) at the points where a race could be attempted.
+_race_hook = None
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(CHUNK), b""):
-            digest.update(block)
-    return digest.hexdigest()
+
+def _race(stage: str, **context) -> None:
+    if _race_hook is not None:
+        _race_hook(stage, **context)
 
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def iter_files(root: Path, links: str = "error"):
-    """Yield files under root, never following links. links='error' raises on any link/junction;
-    links='include' yields the link itself (not descended) so callers can report it."""
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames.sort()
-        keep = []
-        for name in dirnames:
-            full = Path(dirpath) / name
-            if is_link(full):
-                if links == "error":
-                    raise ValueError(f"Refusing link/junction inside the tree: {full}")
-                yield full
-            else:
-                keep.append(name)
-        dirnames[:] = keep
-        for name in sorted(filenames):
-            full = Path(dirpath) / name
-            if links == "error" and is_link(full):
-                raise ValueError(f"Refusing link inside the tree: {full}")
-            yield full
+def _not_found(exc: Exception, what: str) -> ValueError:
+    return ValueError(f"{what} not found: {exc}")
 
 
-def write_manifest(directory: Path, out: Path) -> int:
-    directory = assert_no_links_in_chain(directory)
-    if not directory.is_dir():
-        raise ValueError(f"Not a plain directory: {directory}")
-    if os.path.lexists(out):
-        raise ValueError(f"Manifest already exists, not overwriting: {out}")
-    lines = [f"{sha256_file(f)}  {f.relative_to(directory).as_posix()}" for f in iter_files(directory)]
-    with create_new_file(out) as fh:  # exclusive create, ancestors validated, no write-through
-        fh.write(("\n".join(lines) + ("\n" if lines else "")).encode("utf-8"))
+def write_manifest(directory, out) -> int:
+    """Hash every file under `directory` (links are refused) and write a NEW manifest at `out` (never overwrites)."""
+    directory, out = abs_path(directory), abs_path(out)
+    lines = []
+    try:
+        with safefs.open_dir(directory) as root:
+            for rel, parent, name, _kind in safefs.walk_files(root, links="error"):
+                with parent.open_read(name) as fh:
+                    lines.append(f"{safefs.hash_stream(fh)}  {rel}")
+    except FileNotFoundError as exc:
+        raise ValueError(f"Not a plain directory: {directory} ({exc})") from None
+    try:
+        with safefs.open_dir(out.parent) as odir:
+            try:
+                with odir.create_file(out.name) as nf:  # exclusive: an existing name (file OR link) is refused
+                    nf.write(("\n".join(lines) + ("\n" if lines else "")).encode("utf-8"))
+                    nf.commit(0o644)
+            except FileExistsError:
+                raise ValueError(f"Manifest already exists, not overwriting: {out}") from None
+            odir.verify_bound()
+    except FileNotFoundError as exc:
+        raise ValueError(f"Output folder not found: {exc}") from None
     return len(lines)
 
 
-def verify_manifest(manifest: Path):
-    """Return (failed, missing, extra) relative paths. Entries are confined to the manifest directory and
-    may not pass through links; anything on disk that the manifest does not list is reported as extra."""
-    manifest = assert_no_links_in_chain(manifest)
-    if is_link(manifest):
-        raise ValueError(f"Manifest is a link: {manifest}")
-    base = manifest.parent
-    listed, failed, missing = set(), [], []
-    for num, raw in enumerate(manifest.read_text(encoding="utf-8-sig").splitlines(), 1):
-        if not raw.strip():
-            continue
-        digest, sep, rel = raw.partition("  ")
-        if not sep or len(digest) != 64 or set(digest.lower()) - HEX:
-            raise ValueError(f"Malformed manifest line {num}")
-        target = abs_path(base / rel)
-        if base not in target.parents:
-            raise ValueError(f"Manifest line {num} escapes the manifest directory: {rel!r}")
-        reject_links_under(base, rel)
-        listed.add(rel)
-        if not target.is_file():
-            missing.append(rel)
-        elif sha256_file(target) != digest.lower():
-            failed.append(rel)
-    extra = [f.relative_to(base).as_posix() for f in iter_files(base, links="include")
-             if f != manifest and f.relative_to(base).as_posix() not in listed]
-    return failed, missing, extra
-
-
-def acquire(src: Path, dest_dir: Path, case: str, examiner: str) -> int:
-    """Copy src (file or tree) into dest_dir, verifying hashes; append JSONL custody records.
-    Rejects links anywhere in the source path/tree and anywhere in the destination path; never overwrites."""
-    if not os.path.lexists(src):
-        raise ValueError(f"Source not found: {src}")
-    src = assert_no_links_in_chain(src)          # includes ANCESTOR folders, not only the leaf
-    dest_dir = assert_no_links_in_chain(dest_dir)  # lexical absolute path; nothing is resolved through links
-    if dest_dir == src or src in dest_dir.parents:
-        raise ValueError("Destination must not be inside the source")
-    files = [(src, Path(src.name))] if src.is_file() else [(f, Path(src.name) / f.relative_to(src)) for f in iter_files(src)]
-    make_dirs(dest_dir)
-    log = dest_dir / "custody.jsonl"
-    if is_link(log):
-        raise ValueError(f"Custody log is a link, refusing: {log}")
-    count = 0
-    for file, rel in files:
-        target = dest_dir / rel
-        if os.path.lexists(target):
-            raise ValueError(f"Refusing to overwrite existing evidence: {target}")
-        digest = hashlib.sha256()
-        created = False
+def verify_manifest(manifest):
+    """Return (failed, missing, extra) relative paths. Entries are confined to the manifest directory, are opened
+    through held directories (so no link on the way is followed), and anything on disk that the manifest does not
+    list - including links - is reported as extra."""
+    manifest = abs_path(manifest)
+    try:
+        base_cm = safefs.open_dir(manifest.parent)
+    except FileNotFoundError as exc:
+        raise _not_found(exc, "Manifest folder") from None
+    with base_cm as base:
         try:
-            with file.open("rb") as reader, create_new_file(target) as writer:  # exclusive; every ancestor validated
-                created = True
-                for block in iter(lambda: reader.read(CHUNK), b""):
-                    digest.update(block)
-                    writer.write(block)
-            shutil.copystat(file, target)
-            after = sha256_file(target)
-            if digest.hexdigest() != after:
-                raise ValueError(f"Hash mismatch copying {file}")
-        except Exception:
-            if created and os.path.lexists(target) and not is_link(target):
-                target.unlink()  # only the partial copy WE just created
-            raise
-        target.chmod(0o444)
-        record = {"time": _now(), "case": case, "examiner": examiner, "source": str(file), "copy": str(target),
-                  "sha256": after, "size": target.stat().st_size, "action": "acquire"}
-        append_text(log, json.dumps(record, sort_keys=True) + "\n")
-        count += 1
-    return count
+            with base.open_read(manifest.name) as fh:
+                text = fh.read().decode("utf-8-sig")
+        except FileNotFoundError as exc:
+            raise _not_found(exc, "Manifest") from None
+        listed, failed, missing = set(), [], []
+        for num, raw in enumerate(text.splitlines(), 1):
+            if not raw.strip():
+                continue
+            digest, sep, rel = raw.partition("  ")
+            if not sep or len(digest) != 64 or set(digest.lower()) - HEX:
+                raise ValueError(f"Malformed manifest line {num}")
+            try:
+                safefs.split_relative(rel)  # rejects '..', absolute paths, ':' / device names on Windows
+            except safefs.UnsafePathError as exc:
+                raise ValueError(f"Manifest line {num} is not a safe relative path: {exc}") from None
+            listed.add(rel)
+            try:
+                with safefs.open_relative_file(base, rel) as fh:
+                    if safefs.hash_stream(fh) != digest.lower():
+                        failed.append(rel)
+            except (FileNotFoundError, NotADirectoryError):
+                missing.append(rel)
+        extra = [rel for rel, _p, _n, _k in safefs.walk_files(base, links="include") if rel != manifest.name and rel not in listed]
+        return failed, missing, extra
+
+
+class _Counter:
+    def __init__(self):
+        self.n = 0
+
+
+def _copy_one(src_dir, name: str, dst_dir, log_dir, src_text: str, dst_text: str, case: str, examiner: str, counter: _Counter) -> None:
+    with src_dir.open_read(name) as reader:
+        mtime_ns = getattr(src_dir, "last_mtime_ns", None)
+        _race("after-open-source", src_dir=src_dir, name=name)
+        try:
+            nf = dst_dir.create_file(name)  # exclusive; an existing name (even a link) -> FileExistsError
+        except FileExistsError:
+            raise ValueError(f"Refusing to overwrite existing evidence: {dst_text}") from None
+        with nf:
+            _race("after-create-dest", dst_dir=dst_dir, new_file=nf, name=name)
+            digest = hashlib.sha256()
+            size = 0
+            for block in iter(lambda: reader.read(safefs.CHUNK), b""):
+                digest.update(block)
+                nf.write(block)
+                size += len(block)
+            if nf.hash_back() != digest.hexdigest():  # read back through the SAME open file, never by name
+                raise ValueError(f"Hash mismatch while copying {src_text}")
+            if mtime_ns is not None:
+                nf.set_mtime_ns(mtime_ns)
+            _race("before-commit", dst_dir=dst_dir, new_file=nf, name=name)
+            try:
+                nf.commit(0o444)  # POSIX detects a name collision here (link() never replaces); Windows already did at create time
+            except FileExistsError:
+                raise ValueError(f"Refusing to overwrite existing evidence: {dst_text}") from None
+    record = {"time": _now(), "case": case, "examiner": examiner, "source": src_text, "copy": dst_text,
+              "sha256": digest.hexdigest(), "size": size, "action": "acquire"}
+    with log_dir.open_append("custody.jsonl") as log:
+        log.write((json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+    counter.n += 1
+
+
+def _copy_tree(sdir, ddir, log_dir, src_prefix: str, dst_prefix: str, case: str, examiner: str, counter: _Counter) -> None:
+    for entry in sdir.listdir():
+        if entry.kind in ("link", "other"):
+            raise safefs.UnsafePathError(f"Refusing a link/special file inside the evidence tree: {src_prefix}/{entry.name}")
+        if entry.kind == "dir":
+            with sdir.child_dir(entry.name) as s2, ddir.child_dir(entry.name, create=True) as d2:
+                _copy_tree(s2, d2, log_dir, f"{src_prefix}/{entry.name}", f"{dst_prefix}/{entry.name}", case, examiner, counter)
+        else:
+            _copy_one(sdir, entry.name, ddir, log_dir, f"{src_prefix}/{entry.name}", f"{dst_prefix}/{entry.name}", case, examiner, counter)
+
+
+def acquire(src, dest_dir, case: str, examiner: str) -> int:
+    """Copy `src` (file or tree) into `dest_dir`, verifying hashes; append JSONL custody records.
+
+    Pass 1 only validates (early, cheap refusal). Pass 2 is the authoritative copy and runs entirely on held
+    directories, so a link or rename introduced between the passes cannot redirect anything. Sources are only read.
+    Existing evidence is never overwritten; completed copies are kept if a later file fails."""
+    src_abs, dest_abs = abs_path(src), abs_path(dest_dir)
+    if dest_abs == src_abs or src_abs in dest_abs.parents:
+        raise ValueError("Destination must not be inside the source")
+    try:
+        sp = safefs.open_dir(src_abs.parent)
+    except FileNotFoundError as exc:
+        raise _not_found(exc, "Source") from None
+    with sp:
+        kind = sp.stat_kind(src_abs.name)
+        if kind == "missing":
+            raise ValueError(f"Source not found: {src_abs}")
+        if kind in ("link", "other"):
+            raise safefs.UnsafePathError(f"Source is a link/junction or special file, refusing: {src_abs}")
+        if kind == "dir":  # pass 1: advisory, nothing is copied
+            with sp.child_dir(src_abs.name) as probe:
+                for _ in safefs.walk_files(probe, links="error"):
+                    pass
+        _race("between-passes", src_parent=sp, src_abs=src_abs)  # pass 1 handles are released here; pass 2 must not trust pass 1
+        counter = _Counter()
+        with safefs.open_dir(dest_abs, create=True) as droot:
+            if kind == "file":
+                _copy_one(sp, src_abs.name, droot, droot, str(src_abs), str(dest_abs / src_abs.name), case, examiner, counter)
+            else:
+                with sp.child_dir(src_abs.name) as s_top, droot.child_dir(src_abs.name, create=True) as d_top:
+                    _copy_tree(s_top, d_top, droot, str(src_abs), str(dest_abs / src_abs.name), case, examiner, counter)
+            droot.verify_bound()  # fail loudly if the destination was swapped while we worked
+    return counter.n
 
 
 def main(argv=None) -> int:
@@ -188,7 +233,7 @@ def main(argv=None) -> int:
             print("VERIFICATION FAILED" if bad else "VERIFIED")
             return 1 if bad else 0
         elif args.cmd == "acquire":
-            print(f"Acquired {acquire(args.src, args.dest, args.case, args.examiner)} file(s); custody log: {args.dest / 'custody.jsonl'}")
+            print(f"Acquired {acquire(args.src, args.dest, args.case, args.examiner)} file(s); custody log: {abs_path(args.dest) / 'custody.jsonl'}")
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

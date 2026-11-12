@@ -39,6 +39,12 @@ Nothing is installed automatically. `bash setup-kali.sh` prints the small option
 - Bash (Git Bash on Windows) for the shell tests; `powershell.exe` for the Windows tests. Missing ones cause those tests to be **skipped**, and the runner reports the skip count.
 - Optional static analysis if you install them: `shellcheck` (used automatically by `scripts/test-deck.sh` when present), `ruff`/`pyflakes`.
 
+## Platform support of the safe-file layer (`scripts/safefs.py`)
+
+- Linux (verified on Ubuntu under WSL; Kali not yet): `os.O_NOFOLLOW`, `dir_fd` support in `os.open`/`os.link`/`os.mkdir` (standard on Linux).
+- Windows: `ctypes` (standard library) calling `kernel32`; local fixed/removable volumes only. No third-party package is needed anywhere.
+- Refused with a diagnostic: macOS, UNC/network paths, `subst` drives, non-canonical (8.3) spellings.
+
 ## Compatibility notes
 
 - Python 3.8 is the floor: no `match`, no `X | Y` at runtime, no `Path.write_text(newline=)` (3.10+), no `removeprefix`. `tests/test_py38_compat.py` enforces this statically (an interpreter older than 3.11 was not available when this was written).

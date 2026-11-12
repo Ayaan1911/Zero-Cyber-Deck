@@ -16,13 +16,21 @@ dns_lookup() {
   fi
 }
 
+# Raw HTTP output is SECRET (Location/Refresh with tokens, Set-Cookie, auth headers; curl errors echo the URL). It is held in
+# memory only, passed through scripts/httpsummary.py, and only the sanitized summary is shown and saved:
+# status line + descriptive headers + redacted URLs + cookie NAMES and flags (never values) + [REDACTED] for other headers.
 http_headers() {
   prompt_target 'Enter AUTHORIZED http(s) URL (no [] {} or spaces)' && gate url "$TARGET" http_headers || return 0
+  local path raw
+  path="$(result_path http_headers)" || { say 'Cannot create a result file; refusing to run.'; return 0; }
   # --globoff: no curl URL globbing; --resolve pins the verified address; no proxy, no redirects.
-  # The URL (which may carry secrets) is shown and logged only in redacted form by logrun.
-  logrun http_headers curl --head --silent --show-error --globoff --noproxy '*' --proto '=http,https' \
-    --connect-timeout 5 --max-time 20 --max-redirs 0 --resolve "$G_HOST:$G_PORT:$G_ADDR" "$G_URL"
-  say 'Note: saved response headers can contain Set-Cookie values or tokens; handle the result file as sensitive.'
+  audit http_headers run "$G_HOST" RUN "curl --head (sanitized output) $G_LOGURL" || { rm -f -- "$path"; say 'Not running: the audit entry could not be written.'; return 0; }
+  say "Running: curl --head ... $G_LOGURL   (raw response is never displayed or saved; a sanitized summary follows)"
+  raw="$(curl --head --silent --show-error --globoff --noproxy '*' --proto '=http,https' --connect-timeout 5 --max-time 20 --max-redirs 0 \
+    --resolve "$G_HOST:$G_PORT:$G_ADDR" "$G_URL" 2>&1)"
+  printf '%s\n' "$raw" | ZD_SECRET_URL="$G_URL" "$PY" "$ROOT/scripts/httpsummary.py" | tee "$path"
+  raw=""
+  say "Saved: $path (sanitized summary, UNENCRYPTED)"
 }
 
 tls_certificate() {

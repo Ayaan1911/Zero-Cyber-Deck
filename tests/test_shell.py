@@ -8,6 +8,7 @@
 * only benign local commands stay real: date, uname, uptime, id, ls, tee, tar, grep, sed, mkdir, ...
 """
 import _isolation  # noqa: F401  (blocks real DNS/network for this process)
+import hashlib
 import os
 import shutil
 import subprocess
@@ -49,17 +50,24 @@ TIMEOUT_STUB = '#!/bin/sh\nshift\nexec "$@"\n'  # `timeout N cmd`: runs cmd, whi
 
 @unittest.skipUnless(BASH, "bash not available")
 class ShellCase(unittest.TestCase):
+    INIT_DATA = True
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.tmp = Path(self._tmp.name)
-        self.results = self.tmp / "results"
-        self.notes = self.tmp / "notes"
+        self.tmp = Path(self._tmp.name).resolve()  # the code under test refuses links anywhere above its paths
+        self.data = self.tmp / "ZERO-DATA"          # the operator's data folder, entirely separate from the application folder (ROOT)
+        self.results = self.data / "results"
+        self.notes = self.data / "notes"
+        self.evidence_dir = self.data / "evidence"
         self.scope = self.tmp / "scope.txt"
         self.scope.write_text("192.168.56.0/24\n", encoding="utf-8")
         self.stubs = self.tmp / "stubs"
         self.stubs.mkdir()
         self.log = self.tmp / "stub.log"
         self.dnslog = self.tmp / "dns.log"
+        if self.INIT_DATA:  # python only, no shell: creates the data folder exactly as `bash zero-deck.sh --init-data` would
+            subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / "datadir.py"), "init", "--data", str(self.data), "--app", str(ROOT)],
+                           check=True, capture_output=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         for name in STUBBED:
             self.stub(name, TIMEOUT_STUB if name == "timeout" else LOGGING_STUB)
 
@@ -75,8 +83,8 @@ class ShellCase(unittest.TestCase):
         p.chmod(0o755)
 
     def sh(self, script, stdin="", extra_env=None, fake_dns=""):
-        env = dict(os.environ, ZD_ROOT=ROOT.as_posix(), ZD_SCOPE=self.scope.as_posix(), ZD_RESULTS=self.results.as_posix(),
-                   ZD_NOTES=self.notes.as_posix(), STUBLOG=self.log.as_posix(), ZD_NO_PAUSE="1", ZD_PLAIN="1",
+        env = dict(os.environ, ZD_ROOT=ROOT.as_posix(), ZD_SCOPE=self.scope.as_posix(), ZD_DATA=self.data.as_posix(),
+                   STUBLOG=self.log.as_posix(), ZD_NO_PAUSE="1", ZD_PLAIN="1",
                    STUBDIR=self.stubs.as_posix(), PYTHONPATH=str(SUPPORT), ZD_FAKE_DNS=fake_dns,
                    ZD_DNSLOG=self.dnslog.as_posix(), PYTHONDONTWRITEBYTECODE="1")
         env.update(extra_env or {})
@@ -120,6 +128,7 @@ class ShellCase(unittest.TestCase):
         """Empty the disposable results folder between sub-scenarios."""
         if self.results.exists():
             shutil.rmtree(self.results)
+        self.results.mkdir()
         if self.log.exists():
             self.log.write_text("")
 
@@ -443,7 +452,7 @@ class AuditFailClosedTests(ShellCase):  # audit item 1
 
     def test_symlinked_audit_log_is_refused(self):
         from linkutil import make_file_symlink
-        self.results.mkdir()
+        self.results.mkdir(exist_ok=True)
         real = self.tmp / "real.log"
         real.write_text("")
         if not make_file_symlink(self.results / "audit.log", real):
@@ -496,7 +505,7 @@ class UniqueOutputTests(ShellCase):  # audit item 9
         self.assertEqual(len(list(self.results.glob("triage_FIXED*"))), 2)
 
     def test_unique_file_does_not_touch_existing_files(self):
-        self.results.mkdir()
+        self.results.mkdir(exist_ok=True)
         (self.results / "a.txt").write_text("PRECIOUS")
         r = self.sh('unique_file "$RESULTS" a .txt')
         self.assertNotEqual(Path(r.stdout.strip()).name, "a.txt")
@@ -574,16 +583,14 @@ class UtilityTests(ShellCase):
         self.assertEqual(note.read_text(), "MY WORK")
         self.assertIn("Not created", r.stdout)
 
-    def test_linked_results_parent_makes_every_audit_refuse(self):
+    def test_linked_data_folder_makes_every_audit_refuse(self):
         from linkutil import make_dir_link
-        real = self.tmp / "real_results"
-        real.mkdir()
-        link = self.tmp / "results_link"
-        if not make_dir_link(link, real):
+        link = self.tmp / "data_link"
+        if not make_dir_link(link, self.data):
             self.skipTest("neither symlinks nor junctions can be created here")
-        r = self.sh("audit a b c d e; echo rc=$?", extra_env={"ZD_RESULTS": link.as_posix()})
+        r = self.sh("audit a b c d e; echo rc=$?", extra_env={"ZD_DATA": link.as_posix()})
         self.assertIn("rc=1", r.stdout)
-        self.assertEqual(list(real.iterdir()), [], "an audit row was written through the linked results folder")
+        self.assertEqual(list(self.results.iterdir()), [], "an audit row was written through the linked data folder")
 
     def test_notes_reject_traversal(self):
         self.sh("new_note", stdin="../escape\n")
@@ -594,29 +601,184 @@ class UtilityTests(ShellCase):
     def test_show_scope(self):
         self.assertIn("scope OK", self.sh("show_scope").stdout)
 
-    def test_local_scope_file_takes_precedence_and_is_untracked(self):
+    def test_operator_scope_lives_in_the_data_folder_and_one_in_the_app_folder_is_ignored(self):
         fake_root = self.tmp / "root"
         (fake_root / "lib").mkdir(parents=True)
         (fake_root / "config").mkdir()
         shutil.copy(ROOT / "lib" / "common.sh", fake_root / "lib" / "common.sh")
-        (fake_root / "config" / "scope.txt").write_text("10.0.0.1\n")
-        (fake_root / "config" / "scope.local.txt").write_text("10.0.0.2\n")
-        env = dict(os.environ, ZD_ROOT=fake_root.as_posix(), ZD_SCOPE="", ZD_RESULTS=(self.tmp / "r2").as_posix())
-        r = subprocess.run([BASH, "-c", 'source "$ZD_ROOT/lib/common.sh"; echo "$SCOPE"'], capture_output=True, text=True, env=env)
-        self.assertTrue(r.stdout.strip().endswith("scope.local.txt"), r.stdout)
-        gi = (ROOT / ".gitignore").read_text()
-        self.assertIn("config/scope.local.txt", gi)
+        shutil.copytree(ROOT / "scripts", fake_root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(ROOT / "DATA_FORMAT", fake_root / "DATA_FORMAT")
+        (fake_root / "config" / "scope.txt").write_text("# template\n")
+        (fake_root / "config" / "scope.local.txt").write_text("10.0.0.99\n")  # OLD LAYOUT file inside the app folder: must be ignored
+        (self.data / "config" / "scope.local.txt").write_text("10.0.0.2\n")
+        env = dict(os.environ, ZD_ROOT=fake_root.as_posix(), ZD_SCOPE="", ZD_DATA=self.data.as_posix(), PYTHONDONTWRITEBYTECODE="1")
+        probe = 'source "$ZD_ROOT/lib/common.sh"; echo "$SCOPE"'
+        r = subprocess.run([BASH, "-c", probe], capture_output=True, text=True, env=env)
+        self.assertTrue(r.stdout.strip().replace("\\", "/").endswith("ZERO-DATA/config/scope.local.txt"), r.stdout)
+        (self.data / "config" / "scope.local.txt").unlink()
+        r = subprocess.run([BASH, "-c", probe], capture_output=True, text=True, env=env)
+        self.assertTrue(r.stdout.strip().replace("\\", "/").endswith("root/config/scope.txt"), "falls back to the empty release template, never to a file in the app folder: " + r.stdout)
+        self.assertIn("config/scope.local.txt", (ROOT / ".gitignore").read_text())
 
     def test_encrypt_results_uses_stubbed_gpg_and_writes_outside_results(self):
-        self.results.mkdir()
+        self.results.mkdir(exist_ok=True)
         (self.results / "x.txt").write_text("x")
         self.sh("encrypt_results", extra_env={"ZD_ARCHIVE_DIR": self.tmp.as_posix()})
         args = self.calls("gpg")[0]
         self.assertIn("--symmetric", args)
         self.assertIn("AES256", args)
         out = Path(args[args.index("-o") + 1])
-        self.assertEqual(out.parent.as_posix(), self.tmp.as_posix())  # next to results/, never inside it
+        self.assertEqual(out.parent.as_posix(), self.tmp.as_posix())  # the (overridden) archive folder, never inside results/ or the app folder
         self.assertNotEqual(out.parent.name, "results")
+        tar_calls = [c for c in self.calls() if c[0] == "gpg"]
+        self.assertEqual(len(tar_calls), 1)
+
+
+class DataFolderLifecycleTests(ShellCase):
+    """The data folder is separate, explicit and never created implicitly."""
+    INIT_DATA = False
+
+    def test_without_a_data_folder_everything_that_writes_refuses_and_nothing_is_created(self):
+        r = self.sh("audit a b c d e; echo rc=$?")
+        self.assertIn("rc=1", r.stdout)
+        self.assertIn("AUDIT UNAVAILABLE", r.stderr)
+        self.sh("local_inventory")
+        self.sh("new_note", stdin="x\n")
+        self.sh("gate host 192.168.56.5 a", stdin="YES\n")
+        self.sh("triage_linux")
+        self.assertFalse(self.data.exists(), "the data folder must never be created implicitly")
+        self.assertEqual(self.calls(), [], "no tool may run when its audit entry cannot be written")
+
+    def test_init_data_creates_it_once_and_check_reports_readiness(self):
+        env = dict(os.environ, ZD_DATA=self.data.as_posix(), PYTHONDONTWRITEBYTECODE="1")
+        script = (ROOT / "zero-deck.sh").as_posix()
+        r = subprocess.run([BASH, script, "--check"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 1, "not ready -> --check must fail")
+        self.assertIn("NOT READY", r.stdout)
+        r = subprocess.run([BASH, script, "--init-data"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.data / ".zerodeck-data").is_file())
+        (self.data / "results" / "keep.txt").write_text("mine")
+        r = subprocess.run([BASH, script, "--init-data"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual((self.data / "results" / "keep.txt").read_text(), "mine")
+        r = subprocess.run([BASH, script, "--check"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("READY", r.stdout)
+
+    def test_newer_data_format_blocks_writes(self):
+        subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / "datadir.py"), "init", "--data", str(self.data), "--app", str(ROOT)], check=True, capture_output=True)
+        (self.data / ".zerodeck-data").write_text("format=99\n")
+        r = self.sh("audit a b c d e; echo rc=$?")
+        self.assertIn("rc=1", r.stdout)
+        self.assertIn("do not downgrade", r.stderr)
+
+    def test_old_layout_files_inside_the_application_folder_are_detected_and_never_used(self):
+        fake_root = self.tmp / "root"
+        shutil.copytree(ROOT / "lib", fake_root / "lib")
+        shutil.copytree(ROOT / "scripts", fake_root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(ROOT / "DATA_FORMAT", fake_root / "DATA_FORMAT")
+        (fake_root / "results").mkdir()
+        (fake_root / "results" / "README.md").write_text("placeholder")
+        env = dict(os.environ, ZD_ROOT=fake_root.as_posix(), ZD_DATA=self.data.as_posix(), PYTHONDONTWRITEBYTECODE="1")
+        probe = 'source "$ZD_ROOT/lib/common.sh"; legacy_data_present && echo LEGACY || echo CLEAN'
+        self.assertIn("CLEAN", subprocess.run([BASH, "-c", probe], capture_output=True, text=True, env=env).stdout)
+        (fake_root / "results" / "old_case.txt").write_text("EVIDENCE")
+        self.assertIn("LEGACY", subprocess.run([BASH, "-c", probe], capture_output=True, text=True, env=env).stdout)
+        self.assertEqual((fake_root / "results" / "old_case.txt").read_text(), "EVIDENCE")
+
+
+class ApplicationFolderUntouchedTests(ShellCase):
+    """Audited failure 6 (architecture): code and data are separate, so the application folder always matches its manifest."""
+
+    def snapshot_app(self):
+        out = {}
+        for dirpath, dirs, files in os.walk(ROOT):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for n in files:
+                p = Path(dirpath) / n
+                out[p.relative_to(ROOT).as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return out
+
+    def test_a_full_session_never_writes_into_the_application_folder(self):
+        case = self.tmp / "case"
+        case.mkdir()
+        (case / "a.txt").write_text("a")
+        before = self.snapshot_app()
+        self.sh("local_inventory")
+        self.sh("triage_linux")
+        self.sh("new_note", stdin="n1\n")
+        self.sh("nmap_top_ports", stdin="192.168.56.5\nYES\n")
+        self.sh("http_headers", stdin="https://192.168.56.5/x?a=SECRETVALUE\nYES\n")
+        self.sh("manifest_create", stdin=f"{case.as_posix()}\n")
+        self.sh("evidence_acquire", stdin=f"{case.as_posix()}\n\nC1\ntester\n")
+        self.sh("make_report", stdin="T\nO\n")
+        self.sh("encrypt_results")
+        self.sh("data_status")
+        self.sh("verify_release")
+        self.assertEqual(self.snapshot_app(), before, "the application folder was modified")
+        self.assertTrue((self.results / "audit.log").is_file())
+        self.assertTrue(list(self.results.glob("report_*.md")))
+        self.assertTrue((self.evidence_dir / "case" / "a.txt").is_file(), "evidence defaults to the data folder")
+        self.assertTrue(list(self.notes.glob("*-n1.md")))
+
+    def test_everything_the_operator_owns_lands_in_the_data_folder(self):
+        self.sh("local_inventory")
+        self.sh("triage_linux")
+        landed = sorted(p.relative_to(self.data).parts[0] for p in self.data.rglob("*") if p.is_file() and p.name != ".zerodeck-data")
+        self.assertTrue(set(landed) <= {"results"}, landed)
+
+
+class SanitizedHttpTests(ShellCase):
+    """Audited failure 5: raw HTTP output (Location/Set-Cookie, curl errors echoing the URL) must not be shown or saved."""
+    CURL = (LOGGING_STUB + "printf 'HTTP/1.1 302 Found\\r\\nLocation: https://192.168.56.5/cb?token=SECRETVALUE#SECRETVALUE\\r\\n"
+            "Set-Cookie: sid=SECRETVALUE; Path=/; HttpOnly; Secure\\r\\nX-Session: SECRETVALUE\\r\\nServer: nginx\\r\\n\\r\\n'\n"
+            "printf 'curl: (28) Connection timed out for %s\\n' \"$*\" >&2\n")
+
+    def test_no_secret_is_displayed_saved_or_logged_and_useful_information_remains(self):
+        self.stub("curl", self.CURL)
+        r = self.sh("http_headers", stdin="https://192.168.56.5/x?api=SECRETVALUE\nYES\n")
+        saved = {p: p.read_text(errors="replace") for p in self.results.rglob("*") if p.is_file()}
+        everything = r.stdout + r.stderr + "".join(saved.values())
+        self.assertNotIn("SECRETVALUE", everything)
+        for needle in ("HTTP/1.1 302 Found", "Server: nginx", "Set-Cookie: sid=[REDACTED]; Path=/; HttpOnly; Secure",
+                       "Location: https://192.168.56.5/cb?REDACTED", "X-Session: [REDACTED]"):
+            self.assertIn(needle, r.stdout)
+        result = next(p for p in saved if p.name.endswith("_http_headers.txt"))
+        self.assertIn("Server: nginx", saved[result])
+        self.assertNotIn("Location: https://192.168.56.5/cb?token", everything)
+        self.assertEqual(self.calls("curl")[0][-1], "https://192.168.56.5/x?api=SECRETVALUE", "the authorised request still uses the real URL")
+
+
+class StaticDesignTests(unittest.TestCase):
+    """Guard against re-introducing check-then-write by name in the audit paths, or user-data handling in the updater."""
+
+    def function_body(self, text, name):
+        start = text.index(f"{name}()") if f"{name}()" in text else text.index(f"function {name}")
+        return text[start:start + 1400]
+
+    def test_bash_audit_uses_the_shared_handle_based_writer(self):
+        body = self.function_body((ROOT / "lib" / "common.sh").read_text(encoding="utf-8"), "audit")
+        self.assertIn("auditlog.py", body)
+        self.assertNotIn(">>", body)
+        self.assertNotIn("_chain_has_symlink", (ROOT / "lib" / "common.sh").read_text(encoding="utf-8"))
+
+    def test_powershell_audit_uses_the_shared_writer_and_not_add_content(self):
+        text = (ROOT / "Start-ZeroDeck.ps1").read_text(encoding="utf-8")
+        body = text[text.index("function Write-Audit"):text.index("function Write-Audit") + 1500]
+        self.assertIn("auditlog.py", body.replace("$AuditPy", "auditlog.py") if "$AuditPy" in body else body)
+        self.assertNotIn("Add-Content", body)
+        self.assertNotIn("Test-ChainHasLink", text)
+
+    def test_installer_never_deletes_moves_or_reads_user_data(self):
+        text = (ROOT / "Install-ZeroDeck.ps1").read_text(encoding="utf-8")
+        for forbidden in ("Remove-Item", "Move-Item", "Restore-UserData", "Get-UserDataFiles", "Get-DeckFiles"):
+            self.assertNotIn(forbidden, text, forbidden)
+        self.assertEqual(text.count("Copy-Item"), 1, "the only copy is the manifest-driven staging copy")
+        self.assertNotIn("scripts\\migrate_data.py -", text.replace("python scripts\\migrate_data.py --from", ""))
+
+    def test_scripts_directory_has_no_stale_helper(self):
+        self.assertFalse((ROOT / "scripts" / "pathsafe.py").exists(), "superseded by safefs.py: one mechanism, not two")
 
 
 if __name__ == "__main__":

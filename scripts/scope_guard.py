@@ -14,9 +14,6 @@ A guardrail, not proof of permission. Rules:
 from __future__ import annotations
 
 import argparse
-import datetime
-import getpass
-import hashlib
 import ipaddress
 import re
 import socket
@@ -27,34 +24,12 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pathsafe import append_text, assert_no_links_in_chain  # noqa: E402
+import auditlog  # noqa: E402
+from redaction import redact  # noqa: E402,F401  (re-exported: tests and callers import it from here)
 
 HOST_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
 URL_BAD_RE = re.compile(r"[^\x21-\x7e]|[\\\[\]{}<>^`|\"']")  # non-printable, whitespace, curl globs, quotes
 MAX_ADDRESSES = 256  # /24
-
-_USERINFO_RE = re.compile(r"(//)[^/@\s]*@")
-_PATH_PARAM_RE = re.compile(r";[^/?#\s]*")
-_LONG_SEGMENT_RE = re.compile(r"(?<=/)[A-Za-z0-9_\-.~%]{24,}(?=/|$)")
-
-
-def redact(text: str) -> str:
-    """Best-effort removal of secrets from a URL-ish string before it reaches any log or terminal summary.
-
-    * everything after the first '?' (the WHOLE query, keyed or not: `?token=x`, `?SECRET`, `?a&b`) and after '#'
-      is replaced, whatever its syntax
-    * userinfo (user:password@), path parameters (;jsessionid=...) and long token-like path segments are replaced
-    Best effort: a secret in an ordinary short path segment cannot be recognised."""
-    text = _USERINFO_RE.sub(r"\1REDACTED@", text)
-    cut = min((i for i in (text.find("?"), text.find("#")) if i != -1), default=-1)
-    tail = ""
-    if cut != -1:
-        tail = text[cut] + "REDACTED"
-        text = text[:cut]
-    if "/" in text:  # path rules only for URL-shaped strings: a ';' in an ordinary message is not a path parameter
-        text = _PATH_PARAM_RE.sub(";REDACTED", text)
-        text = _LONG_SEGMENT_RE.sub("REDACTED", text)
-    return text + tail
 
 
 class OutOfScope(Exception):
@@ -205,29 +180,11 @@ def approved(scope_file: Path, target: str, kind: str, resolver: Resolver = reso
         return False
 
 
-def _clean(text: str) -> str:
-    return re.sub(r"[\x00-\x1f\x7f]", "?", text)[:300]
-
-
 def _audit(path: Path, action: str, kind: str, target: str, verdict: str, detail: str, scope_file: Path) -> None:
+    """Append through the shared safefs-based writer. Any failure is an OSError so the caller fails closed."""
     try:
-        assert_no_links_in_chain(path)  # the log AND every ancestor folder: a linked parent would redirect the write
-    except ValueError as exc:
-        raise OSError(str(exc)) from None
-    try:
-        digest = hashlib.sha256(scope_file.read_bytes()).hexdigest()[:16]
-    except OSError:
-        digest = "unreadable"
-    try:
-        user = getpass.getuser()
-    except Exception:  # noqa: BLE001 - getuser can raise many things on odd systems
-        user = "unknown"
-    # redact EVERY kind: a mistyped host like "10.0.0.5?secret" must not reach the log either (hostnames/CIDRs are unaffected)
-    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), _clean(user),
-                     _clean(action), kind, _clean(redact(target)), verdict, digest, _clean(redact(detail))])
-    try:
-        append_text(path, row + "\n")  # no-follow append; creates the folder safely if missing
-    except ValueError as exc:
+        auditlog.append_row(path.parent, auditlog.format_row(action, kind, target, verdict, detail, scope_file), name=path.name)
+    except ValueError as exc:  # UnsafePathError / UnsupportedConfigurationError are ValueErrors
         raise OSError(str(exc)) from None
 
 

@@ -1,7 +1,8 @@
 Large Ventoy data partition (typically exFAT):
 /
 |- ISO/                   (download ISOs here yourself and verify their checksums)
-|- ZERO-Deck/             (this project; copy with Install-ZeroDeck.ps1)
+|- ZERO-Deck/             (the APPLICATION: code only, installed by Install-ZeroDeck.ps1, matches SHA256SUMS.txt)
+|- ZERO-DATA/             (YOUR data: results, notes, evidence, scope, audit log. Never touched by the installer.)
 |- ventoy/ventoy.json     (optional, only when configuring persistence manually)
 `- persistence/           (optional Kali backend .dat file, created manually on Linux)
 

@@ -68,3 +68,8 @@ ZERO-Deck.bak-*/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# ---- the separate data folder and installer leftovers (never part of the application repository) ----
+ZERO-DATA/
+ZERO-Deck.failed-*/
+.zerodeck-data

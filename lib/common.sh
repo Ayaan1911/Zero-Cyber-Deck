@@ -1,15 +1,22 @@
 # shellcheck shell=bash
 # ZERO Deck shared library: environment, registry, scope gate, logging. Source only; never run directly.
 
-ZD_VERSION="2.1.0"
+ZD_VERSION="3.0.0"
 ROOT="${ZD_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
-if [ -n "${ZD_SCOPE:-}" ]; then SCOPE="$ZD_SCOPE"
-elif [ -f "$ROOT/config/scope.local.txt" ]; then SCOPE="$ROOT/config/scope.local.txt"  # untracked: real targets stay out of git
-else SCOPE="$ROOT/config/scope.txt"; fi
-RESULTS="${ZD_RESULTS:-$ROOT/results}"
-NOTES="${ZD_NOTES:-$ROOT/notes}"
+export PYTHONDONTWRITEBYTECODE=1   # never write __pycache__ into the application folder (it must match SHA256SUMS.txt)
 umask 077
-mkdir -p "$RESULTS" 2>/dev/null || printf 'warning: cannot create %s (read-only media?)\n' "$RESULTS" >&2
+
+# ---- application folder (ROOT) vs data folder (DATA) -----------------------------------------------------------------
+# ROOT holds code only and must match the release manifest. DATA (default: sibling folder ZERO-DATA, or $ZD_DATA) holds
+# results, notes, evidence, the operator's scope file and the audit log. The data folder is NEVER created implicitly:
+# run `bash zero-deck.sh --init-data` once. Nothing in ROOT is ever written by the deck.
+DATA="${ZD_DATA:-$(cd -- "$ROOT/.." && pwd)/ZERO-DATA}"
+RESULTS="${ZD_RESULTS:-$DATA/results}"
+NOTES="${ZD_NOTES:-$DATA/notes}"
+EVIDENCE="${ZD_EVIDENCE:-$DATA/evidence}"
+if [ -n "${ZD_SCOPE:-}" ]; then SCOPE="$ZD_SCOPE"
+elif [ -f "$DATA/config/scope.local.txt" ]; then SCOPE="$DATA/config/scope.local.txt"  # operator-owned, outside the app folder
+else SCOPE="$ROOT/config/scope.txt"; fi                                                  # the empty release template: everything is denied
 
 PY=""
 for _c in python3 python py; do
@@ -19,14 +26,21 @@ for _c in python3 python py; do
 done
 unset _c
 
-# results/ must not sit behind a link or junction (a linked parent would redirect every audit entry and result file).
-# Checked once with python (detects Windows junctions); audit() re-checks symlinks on every call without forking.
-RESULTS_SAFE=1
-if [ -n "$PY" ] && ! "$PY" "$ROOT/scripts/pathsafe.py" check "$RESULTS" >/dev/null 2>&1; then
-  RESULTS_SAFE=0
-  printf 'warning: the results path passes through a link/junction (%s); audit logging, and so every audited action, is refused.\n' "$RESULTS" >&2
+# DATA_READY=1 only if the data folder exists, is marked as a ZERO data folder and is compatible with this application.
+# Everything that writes (audit log, results, notes, evidence) refuses to run otherwise.
+DATA_READY=0
+DATA_MSG="Python 3.8+ is required"
+if [ -n "$PY" ]; then
+  if DATA_MSG="$("$PY" "$ROOT/scripts/datadir.py" check --data "$DATA" --app "$ROOT" 2>&1)"; then DATA_READY=1; fi
 fi
-_chain_has_symlink() { local p="$1"; while [[ "$p" == */* ]]; do [ -L "$p" ] && return 0; p="${p%/*}"; done; return 1; }
+legacy_data_present() { # old in-tree layout: operator files inside the application folder
+  local f
+  for f in "$ROOT"/results/* "$ROOT"/notes/* "$ROOT/config/scope.local.txt"; do
+    [ -e "$f" ] || continue
+    case "$f" in */README.md) ;; *) return 0 ;; esac
+  done
+  return 1
+}
 
 say() { printf '%s\n' "$*"; }
 pause() { [ -n "${ZD_NO_PAUSE:-}" ] || read -r -p $'\nPress Enter to continue... ' _ || true; }
@@ -63,15 +77,14 @@ reg() { ZD_REG+=("$1|$2|$3|${4:-}"); }
 regm() { ZD_REG+=("$1|[MANUAL] $2|$3|${4:-}"); }
 
 # ---- audit log (plain text: records activity, does NOT prevent tampering) ----------------------
-# audit <action> <kind> <target> <verdict> <detail>. Returns 1 when the entry cannot be written: callers MUST stop.
+# audit <action> <kind> <target> <verdict> <detail>. Written by scripts/auditlog.py through held directory handles
+# (the whole path is walked without following links; no check-then-write by name). Returns 1 when the entry cannot be
+# written: callers MUST stop.
 audit() {
-  local log="$RESULTS/audit.log"
-  if [ "$RESULTS_SAFE" != 1 ] || _chain_has_symlink "$log" || { [ -e "$log" ] && [ ! -f "$log" ]; }; then
-    printf 'AUDIT LOG UNUSABLE (%s, or a folder above it, is a link/junction or not a regular file): refusing to continue.\n' "$log" >&2; return 1
-  fi
-  { printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-${USERNAME:-unknown}}" \
-    "$1" "$2" "${3//[$'\t\r\n']/ }" "$4" "${5//[$'\t\r\n']/ }" >>"$log"; } 2>/dev/null ||
-    { printf 'AUDIT WRITE FAILED (%s): refusing to continue.\n' "$log" >&2; return 1; }
+  if [ "$DATA_READY" != 1 ]; then printf 'AUDIT UNAVAILABLE: %s
+' "$DATA_MSG" >&2; return 1; fi
+  "$PY" "$ROOT/scripts/auditlog.py" append --results "$RESULTS" --action="$1" --kind="$2" --target="$3" --verdict="$4" --detail="$5"     --scope "$SCOPE" >/dev/null || { printf 'AUDIT WRITE FAILED (%s): refusing to continue.
+' "$RESULTS" >&2; return 1; }
 }
 
 confirm_word() { local c; read -r -p "$2 [type $1]: " c || return 1; [ "$c" = "$1" ]; }
