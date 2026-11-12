@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from scope_guard import OutOfScope, approved, evaluate, parse_allowed  # noqa: E402
+from scope_guard import approved, evaluate, parse_allowed  # noqa: E402
 
 GUARD = ROOT / "scripts" / "scope_guard.py"
 DNS = {"lab.example": ["192.168.56.10"], "multi.example": ["192.168.56.10", "8.8.8.8"],
