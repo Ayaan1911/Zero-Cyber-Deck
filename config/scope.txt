@@ -1,7 +1,12 @@
 # ZERO Deck authorized scope. EMPTY BY DEFAULT.
-# Fill in ONLY lab systems, networks and domains you own or have explicit permission to test.
-# One IPv4, IPv4 CIDR, or exact fully-qualified domain name per line.
-# Network discovery is capped at /24, and an entire CIDR must fit an entry here.
+# Fill in ONLY lab systems, networks and domains you own or have explicit written permission to test.
+# One entry per line: an IPv4 address, an IPv4 CIDR no broader than /24, or an exact fully-qualified domain name.
+# Rules enforced by scripts/scope_guard.py:
+#   - entries broader than /24 (e.g. 10.0.0.0/8) are rejected, and so is IPv6
+#   - a listed domain is only usable if EVERY IPv4 address it resolves to is inside a listed IP/CIDR entry,
+#     so list the lab host's IP as well as its name
+#   - each scan target is checked, normalized and pinned to the verified IP before any tool runs
+# Edit with any editor (Windows Notepad is fine; a UTF-8 BOM is tolerated).
 # Examples (DO NOT COPY unless you actually control these targets):
 # 192.168.56.0/24
 # 10.10.10.15

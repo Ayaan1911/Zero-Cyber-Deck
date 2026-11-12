@@ -116,6 +116,18 @@ class DashboardTests(ShellCase):
         self.assertIn("no_such_tool_xyz", r.stdout)
         self.assertIn("install", r.stdout)
 
+    def test_registry_functions_exist_and_docs_present(self):
+        r = self.sh('for e in "${ZD_REG[@]}"; do IFS="|" read -r c l f d <<<"$e"; declare -F "$f" >/dev/null || echo "NOFUNC $f"; '
+                    'for t in $d; do hint "$t" | grep -q "^install \'" && echo "NOHINT $t"; done; done')
+        self.assertEqual(r.stdout.strip(), "", r.stdout)
+        for doc in ("LEARNING.md", "RECOVERY.md", "IR-CHECKLIST.md"):
+            self.assertTrue((ROOT / "docs" / doc).is_file(), doc)
+
+    def test_every_module_category_is_known(self):
+        r = self.sh('for e in "${ZD_REG[@]}"; do c="${e%%|*}"; ok=0; for k in "${ZD_CATS[@]}"; do [ "$k" = "$c" ] && ok=1; done; '
+                    '[ $ok = 1 ] || echo "BADCAT $c"; done')
+        self.assertEqual(r.stdout.strip(), "")
+
     def test_all_categories_have_tools(self):
         r = self.sh('for c in "${ZD_CATS[@]}"; do n=0; for e in "${ZD_REG[@]}"; do [ "${e%%|*}" = "$c" ] && n=$((n+1)); done; echo "$c=$n"; done')
         for line in r.stdout.splitlines():

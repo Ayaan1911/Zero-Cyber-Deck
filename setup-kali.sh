@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Optional, intentionally interactive installer; no auto-run.
 set -euo pipefail
-PACKAGES=(nmap curl openssl dnsutils whois traceroute iproute2 net-tools jq coreutils)
+PACKAGES=(nmap curl openssl dnsutils whois traceroute iproute2 net-tools jq coreutils file smartmontools testdisk gnupg)
 cat <<'TXT'
 ZERO Deck's scripts do not need all packages in advance.
 For stock Kali Live, many may already exist.

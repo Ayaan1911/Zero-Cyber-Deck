@@ -33,7 +33,7 @@ hint() {
     smartctl) echo "sudo apt install smartmontools" ;; lsblk) echo "sudo apt install util-linux" ;;
     testdisk) echo "sudo apt install testdisk" ;; file) echo "sudo apt install file" ;;
     ss|ip) echo "sudo apt install iproute2" ;; whois) echo "sudo apt install whois" ;;
-    traceroute) echo "sudo apt install traceroute" ;; *) echo "install '$1' with your package manager" ;;
+    traceroute) echo "sudo apt install traceroute" ;; gpg) echo "sudo apt install gnupg" ;; tar) echo "sudo apt install tar" ;; *) echo "install '$1' with your package manager" ;;
   esac
 }
 missing_of() { local t m=(); for t in $1; do have "$t" || m+=("$t"); done; printf '%s' "${m[*]:-}"; }
