@@ -1,0 +1,8 @@
+# ZERO Deck authorized scope. EMPTY BY DEFAULT.
+# Fill in ONLY lab systems, networks and domains you own or have explicit permission to test.
+# One IPv4, IPv4 CIDR, or exact fully-qualified domain name per line.
+# Network discovery is capped at /24, and an entire CIDR must fit an entry here.
+# Examples (DO NOT COPY unless you actually control these targets):
+# 192.168.56.0/24
+# 10.10.10.15
+# lab.example

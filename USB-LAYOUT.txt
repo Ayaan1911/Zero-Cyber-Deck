@@ -1,0 +1,8 @@
+Large Ventoy data partition (typically exFAT):
+/
+|- ISO/                   (download your ISOs here yourself)
+|- ZERO-Deck/             (this ZIP's directory)
+|- ventoy/                (optional Ventoy plugin, configured manually)
+`- persistence/           (optional Kali backend file, configured manually)
+
+USB is NOT formatted or bootable just by extracting this ZIP.

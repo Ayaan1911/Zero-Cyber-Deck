@@ -1,0 +1,8 @@
+{
+  "persistence": [
+    {
+      "image": "/ISO/RENAME_TO_YOUR_EXACT_KALI_LIVE_FILENAME.iso",
+      "backend": "/persistence/kali-persistence.dat"
+    }
+  ]
+}

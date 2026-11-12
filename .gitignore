@@ -1,0 +1,14 @@
+results/*
+!results/README.md
+*.dat
+*.iso
+*.img
+*.vhd
+*.vhdx
+*.qcow2
+*.pcap
+*.pcapng
+*.log
+__pycache__/
+*.pyc
+.DS_Store
