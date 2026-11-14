@@ -1,6 +1,6 @@
 # Setup and manual USB deployment (SanDisk Cruzer Blade 64 GB, USB 2.0)
 
-> **Status:** nothing below has been tested on real hardware. The scripts are tested with automated tests only (see README "Verification status"). Boot/persistence steps follow the vendors' documentation and must be verified by you, one step at a time.
+> **Status:** the Ventoy 1.1.18 / Kali 2026.3 Live boot and ZERO Deck launch succeeded on physical hardware (docs/PHYSICAL-USB-BOOT.md). ZERO-DATA persistence and the remaining setup steps are unverified.
 
 ## 0. Strategy
 
@@ -56,7 +56,7 @@ Expected layout: see `USB-LAYOUT.txt`.
 | Ventoy EFI partition (~32 MB, `VTOYEFI`) | FAT | Ventoy's boot files. **Leave it exactly as Ventoy created it.** |
 | An extra partition you add yourself | ext4 (label e.g. `ZERODATA`) | the Linux `ZERO-DATA` (results, notes, evidence, `config/scope.local.txt`, audit log) |
 
-Ventoy keeps its EFI partition at the end of the disk, so an extra ext4 partition means shrinking the data partition and placing the new one in front of the EFI partition. Do that with Linux tools on a disposable test stick first (resizing a partition table can destroy data) and follow Ventoy's own disk-layout documentation; this project does not do it for you. A second USB stick, or an ext4 folder on the laptop's disk, works equally well and is safer to start with.
+Ventoy's documented extra-partition layout uses space reserved when Ventoy is installed; its first two partitions must retain their positions and sizes. Do not shrink this working installation in place based on this guide. A backed-up rebuild with reserved space, a second USB stick, or an ext4 folder on the laptop's disk are options to evaluate in Phase 2.
 
 **Using it on Kali:** mount the ext4 partition so that your user can write to it, then run `ZD_DATA=<mountpoint>/ZERO-DATA bash zero-deck.sh --init-data` and use the same `ZD_DATA` for every later command. ext4 honours permissions, so an evidence copy really is read-only. `--init-data` probes the filesystem first and refuses (removing only the empty folder it created itself) if safe publishing is impossible.
 
@@ -68,9 +68,9 @@ Two systems must not write to the same ZERO-DATA at the same time.
 
 1. With the USB inserted, restart and open the ASUS boot menu (often **Esc** or **F8**, model dependent). Choose the USB, then the Kali **Live** ISO in the Ventoy menu.
 2. If Secure Boot blocks Ventoy, follow Ventoy's current Secure Boot documentation (MOK enrollment). Do not change UEFI settings casually; record what you changed.
-3. In Kali Live open a terminal. Find the data partition (`lsblk -f`, label `Ventoy`); mount it read-write if not auto-mounted: `udisksctl mount -b /dev/<verified-partition>`. **Never run a command on a `/dev/sdX` you have not verified.**
-4. `cd` to the mounted `ZERO-Deck` folder (the sibling `ZERO-DATA` is found automatically; override with `ZD_DATA=/path`) and run `bash zero-deck.sh` (use `bash`; exFAT has no execute bit). Run `bash zero-deck.sh --check` first to see which tools exist.
-5. Initialise the data folder once (`bash zero-deck.sh --init-data`; the installer already did it if it was absent), then create `ZERO-DATA/config/scope.local.txt` with ONLY your authorized lab targets (list a lab hostname **and** its IP). The `config/scope.txt` inside the application folder is the empty release template and is never edited. Test with local inventory first; then your own lab. Wireshark, Burp, Metasploit and TestDisk are **[MANUAL]** items: the scope gate cannot constrain them.
+3. In Kali Live, inspect `lsblk -f` and existing mounts. The verified Phase 1 path mounted `/dev/mapper/VentoyPart` read-only; see `docs/PHYSICAL-USB-BOOT.md`. Do not mount its backing partition again by another name.
+4. `cd` to the mounted `ZERO-Deck` folder and run `bash zero-deck.sh --check`, then `bash zero-deck.sh` (use `bash`; exFAT has no execute bit). Until ZERO-DATA is ready, `--check` exits nonzero and writes are refused.
+5. After Phase 2 provides a verified ext4 mount, select it with `ZD_DATA=<mountpoint>/ZERO-DATA` for initialization and every later run. Put authorized lab targets only in that data folder's `config/scope.local.txt`; the application `config/scope.txt` remains the empty template. Wireshark, Burp, Metasploit and TestDisk are **[MANUAL]** items: the scope gate cannot constrain them.
 
 Keys in the dashboard: arrows or `j`/`k` move, `Enter` selects, `1`-`9` jump, `q`/Esc goes back. `bash zero-deck.sh --plain` uses numbered menus.
 
@@ -88,14 +88,14 @@ Ventoy persistence docs: https://www.ventoy.net/en/plugin_persistence.html ; Kal
 ## 4. Daily workflow
 
 - **No reboot (Windows):** `powershell -NoProfile -File .\Start-ZeroDeck.ps1` for hashing, scope-gated DNS/traceroute, triage, reports.
-- **USB boot:** Ventoy -> Kali Live -> mount data partition -> `bash zero-deck.sh`.
+- **USB boot:** Ventoy -> Kali Live -> read-only `VentoyPart` mount -> `bash zero-deck.sh` (Phase 1; ZERO-DATA persistence pending).
 - **Heavy work:** use a Kali VM on the laptop SSD; keep the scripts on the stick.
 - Wireshark, Burp, Metasploit and TestDisk are **[MANUAL]** items: you must type `MANUAL` (not `YES`) to launch them, they are audited as `manual`, and the scope gate cannot constrain what they do. Scoped actions (Nmap, DNS, HTTP headers, TLS) ask for `YES` after a no-DNS pre-check and then resolve and verify the target. The deck never runs exploits.
 
 ## 5. Troubleshooting
 
 - Kali won't boot: check ISO checksum, UEFI/Secure Boot, newer Ventoy, try SystemRescue to isolate hardware issues.
-- Files vanish after reboot: you used non-persistent Live; save to the mounted data partition.
+- Files vanish after reboot: Kali Live is non-persistent, and ZERO-DATA persistence is still pending. Do not treat the exFAT application partition as Linux ZERO-DATA.
 - `Missing tool`: the dashboard shows the apt package. `bash setup-kali.sh` prints the optional package list (dry run) and installs only with `--install` plus typing INSTALL. Installs in Live mode vanish at reboot.
 - `OUT OF SCOPE` / `SCOPE ERROR`: edit your scope file (`config/scope.local.txt`; rules are in the template `config/scope.txt`). Never add a target just to get past the check.
 - A hostname is refused although listed: its resolved IPs must be listed too (shown in the message).
@@ -106,10 +106,11 @@ Ventoy persistence docs: https://www.ventoy.net/en/plugin_persistence.html ; Kal
 ## 6. Hardware verification checklist (you do this; record results)
 
 - [ ] Ventoy installed on the correct disk; ISOs checksum-verified
-- [ ] Laptop boots the Ventoy menu (UEFI; Secure Boot state noted)
-- [ ] Kali Live boots to desktop; time to boot noted
-- [ ] Data partition mounts read-write; `bash zero-deck.sh --check` runs
-- [ ] Local inventory works; results written to `results/`
+- [x] Laptop boots the Ventoy menu (Secure Boot operation not established)
+- [x] Kali Live boots to desktop
+- [x] Ventoy data partition mounts read-only through `/dev/mapper/VentoyPart`; `bash zero-deck.sh --check` runs and reports ZERO-DATA NOT READY
+- [x] ZERO Deck dashboard and Utilities submenu work; all 17 checked dependencies detected
+- [ ] ZERO-DATA persists across two boots; local inventory results written to its `results/`
 - [ ] Scope-gated lab scan against your own lab VM works and an out-of-scope target is refused
 - [ ] `Install-ZeroDeck.ps1 -DryRun`, then a real install, then `-Update`: your own test file in `results\` is still there, byte-identical, and a `.bak-` folder exists
 - [ ] (optional) persistence survives a reboot

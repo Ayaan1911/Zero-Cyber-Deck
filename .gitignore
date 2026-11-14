@@ -17,8 +17,15 @@ config/scope.local.txt
 
 # ---- images, persistence backends, captures, downloaded media ----------------------------------------
 *.iso
+*.ISO
 *.img
+*.IMG
 *.dat
+*.DAT
+*.ext4
+*.EXT4
+*.raw
+*.RAW
 *.wim
 *.vhd
 *.vhdx
